@@ -9,9 +9,12 @@ import uuid
 from datetime import datetime, timedelta
 import pytz
 from telethon import TelegramClient, events, Button
+from telethon.sessions import StringSession
 from telethon.errors import (
     ChannelPrivateError, FloodWaitError,
     UsernameNotOccupiedError, UsernameInvalidError,
+    SessionPasswordNeededError, PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
 )
 from decouple import config
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -73,6 +76,7 @@ channels_col  = _db.channels
 processed_col = _db.processed_msgs
 settings_col  = _db.settings
 pending_col   = _db.pending_private
+sessions_col  = _db.user_sessions    # {user_id, session_string, phone}
 
 # ── Bot Client ────────────────────────────────────────────────────────────────
 bot = TelegramClient("bot_session", APP_ID, API_HASH).start(bot_token=BOT_TOKEN)
@@ -88,6 +92,14 @@ S_WAIT_TO_CH      = "wait_to_ch"
 S_WAIT_TRIAL_DAYS = "wait_trial_days"
 S_WAIT_BROADCAST  = "wait_broadcast"
 S_WAIT_PREMIUM_OP = "wait_premium_op"
+S_WAIT_PHONE      = "wait_phone"
+S_WAIT_OTP        = "wait_otp"
+S_WAIT_2FA        = "wait_2fa"
+
+# Active userbot clients {user_id: TelegramClient}
+user_clients:  dict = {}
+# Temporary clients used during login before session is saved
+login_clients: dict = {}
 
 def get_state(uid):
     return user_states.get(uid, {"state": S_IDLE, "data": {}})
@@ -200,12 +212,16 @@ async def show_main_menu(event, uid, edit=False):
         "Manage your auto-forwarding setups using the buttons below.\n\n"
         f"Plan: {plan_icon} {'Premium ✅' if prem else 'Free / Trial'}"
     )
+    has_session = uid in user_clients
+    login_label = "🔴 Logout Account" if has_session else "🔑 Login Account"
+    login_cb    = b"logout_confirm"    if has_session else b"login_start"
     btns = [
         [Button.inline("📋 My Setups",  b"setups_list"),
          Button.inline("➕ New Setup",   b"new_setup")],
         [Button.inline(f"{plan_icon} My Plan", b"my_plan"),
          Button.inline("💎 Premium",    b"premium_info")],
-        [Button.inline("❓ Help",        b"help")],
+        [Button.inline(login_label,     login_cb),
+         Button.inline("❓ Help",       b"help")],
     ]
     if uid in ADMINS:
         btns.append([Button.inline("🔧 Admin Panel", b"admin_panel")])
@@ -401,6 +417,126 @@ async def cmd_cancel(event):
     clear_state(uid)
     await event.respond("✅ Cancelled.", buttons=[[Button.inline("🏠 Main Menu", b"main_menu")]])
 
+
+# ── /myplan ───────────────────────────────────────────────────────────────────
+@bot.on(events.NewMessage(pattern=r"^/myplan$", func=lambda e: e.is_private))
+async def cmd_myplan(event):
+    uid = event.sender_id
+    await ensure_user(uid)
+    unjoined = await check_force_sub(uid)
+    if unjoined:
+        await send_force_sub_msg(event, unjoined)
+        return
+    await show_my_plan(event, uid)
+
+# ── /plan ─────────────────────────────────────────────────────────────────────
+@bot.on(events.NewMessage(pattern=r"^/plan$", func=lambda e: e.is_private))
+async def cmd_plan(event):
+    uid = event.sender_id
+    await ensure_user(uid)
+    unjoined = await check_force_sub(uid)
+    if unjoined:
+        await send_force_sub_msg(event, unjoined)
+        return
+    try:
+        await bot.send_file(
+            uid, PAYMENT_QR,
+            caption=PAYMENT_TEXT,
+            parse_mode="html",
+            buttons=[[Button.inline("◀️ Back", b"main_menu")]]
+        )
+    except Exception:
+        await event.respond(PAYMENT_TEXT, parse_mode="html",
+                            buttons=[[Button.inline("◀️ Back", b"main_menu")]])
+
+# ── /help ─────────────────────────────────────────────────────────────────────
+@bot.on(events.NewMessage(pattern=r"^/help$", func=lambda e: e.is_private))
+async def cmd_help(event):
+    uid = event.sender_id
+    await ensure_user(uid)
+    unjoined = await check_force_sub(uid)
+    if unjoined:
+        await send_force_sub_msg(event, unjoined)
+        return
+    text = (
+        "📘 **ChannelAutoPost — Complete Help Guide**\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**🤖 What Does This Bot Do?**\n"
+        "Automatically forwards new messages from source (FROM) channels "
+        "to destination (TO) channels in real-time.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**⚡ Quick Start (5 Steps)**\n"
+        "1️⃣ Use /start → tap **➕ New Setup** → enter a name\n"
+        "2️⃣ Tap **➕ Add FROM** → send the source channel\n"
+        "3️⃣ Tap **➕ Add TO** → send the destination channel\n"
+        "4️⃣ Tap **▶️ Activate** to start forwarding\n"
+        "5️⃣ Done! New posts will be auto-forwarded\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**📡 Channel Types**\n"
+        "🌐 **Public Channel** — Has a public username (@channelname)\n"
+        "  • Option A: Make bot **Admin** in the FROM channel → instant forwarding\n"
+        "  • Option B: /login with your Telegram account → bot joins on your behalf, "
+        "no admin needed\n\n"
+        "🔒 **Private Channel** — No public username\n"
+        "  • Bot MUST be **Admin** in the FROM channel\n"
+        "  • Bot MUST be **Admin** in the TO channel\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**🔑 Login Feature (for Public Channels without Admin)**\n"
+        "If you cannot make the bot admin in a public FROM channel, "
+        "you can log in with your own Telegram account:\n"
+        "  • Tap **🔑 Login Account** on the main menu\n"
+        "  • Enter your phone number (with country code, e.g. +919876543210)\n"
+        "  • Enter the OTP sent to your Telegram app\n"
+        "  • If 2FA is enabled, enter your cloud password too\n"
+        "  • Once logged in, any public FROM channel you add will be "
+        "auto-joined by your account\n"
+        "  • Tap **🔴 Logout Account** to remove your session\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**📥 Adding Channels**\n"
+        "Send the channel in any of these formats:\n"
+        "  • `@username`\n"
+        "  • `https://t.me/username`\n"
+        "  • Numeric ID: `-1001234567890`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**🗺️ Channel Mapping**\n"
+        "You can add multiple FROM and TO channels in one setup:\n"
+        "  FROM[1] → TO[1]\n"
+        "  FROM[2] → TO[2]\n"
+        "  FROM[3] → TO[2] _(extras map to last TO)_\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**🎛 Filters**\n"
+        "Inside each setup tap **🎛 Filters** to control what gets forwarded:\n"
+        "  📝 Text · 🖼 Photo · 🎬 Video · 📄 Document\n"
+        "  🎵 Audio · 🎭 Sticker · 🎞 GIF · 🎤 Voice\n"
+        "  ⭕ Round Video · 📊 Poll · 🔁 Forwarded msgs\n"
+        "  🚫 Remove Fwd Tag — sends as copy (no 'Forwarded from' header)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**⚙️ Setup Controls**\n"
+        "  ▶️ **Activate / ⏸ Pause** — start or pause forwarding\n"
+        "  ✏️ **Rename** — change the setup name\n"
+        "  🗑 **Delete** — permanently delete setup + all channels\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**🛡 Auto Channel Health Check**\n"
+        "If a FROM channel becomes inaccessible (deleted, banned, made private), "
+        "the bot checks it up to **3 times**. If all 3 checks fail, "
+        "the channel is auto-removed and you receive a notification.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**💎 Premium Required For**\n"
+        "  • Creating and activating setups\n"
+        "  • Adding channels\n"
+        "  • All forwarding features\n\n"
+        "Use /plan to see pricing or /myplan to check your current plan.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "**📋 All Commands**\n"
+        "  /start — Open main menu\n"
+        "  /myplan — Check your current plan\n"
+        "  /plan — View premium plans & pricing\n"
+        "  /help — Show this guide\n"
+        "  /cancel — Cancel any ongoing action"
+    )
+    await event.respond(text, parse_mode="md",
+                        buttons=[[Button.inline("🏠 Main Menu", b"main_menu")]])
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  CALLBACK QUERY HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,18 +565,30 @@ async def on_callback(event):
         await show_my_plan(event, uid)
 
     elif data == "help":
+        await event.answer()
         text = (
-            "❓ **Help Guide**\n\n"
-            "**Step 1:** Tap **➕ New Setup** and give it a name.\n"
-            "**Step 2:** Open the setup → tap **➕ Add FROM** and send the channel.\n"
-            "**Step 3:** Tap **➕ Add TO** and send the destination channel.\n"
-            "**Step 4:** Tap **▶️ Activate** to start forwarding.\n\n"
-            "**Channel types:**\n"
-            "🌐 Public — auto-scanned every 10s (no admin needed)\n"
-            "🔒 Private — bot must be added as admin\n\n"
-            "**Adding a channel:** Just send `@username`, a t.me link, or channel ID.\n\n"
-            "**Mapping:** FROM[1]→TO[1], FROM[2]→TO[2], extras → last TO channel\n\n"
-            "**Filters:** Control which message types are forwarded (Photo, Video, etc.)"
+            "📘 **ChannelAutoPost — Complete Help Guide**\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "**⚡ Quick Start**\n"
+            "1️⃣ Tap **➕ New Setup** → enter a name\n"
+            "2️⃣ Tap **➕ Add FROM** → send the source channel\n"
+            "3️⃣ Tap **➕ Add TO** → send the destination channel\n"
+            "4️⃣ Tap **▶️ Activate** to start forwarding\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "**📡 Channel Types**\n"
+            "🌐 **Public** — make bot Admin OR use /login\n"
+            "🔒 **Private** — bot must be Admin in both channels\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "**🔑 Login (Public channels without Admin)**\n"
+            "Tap **🔑 Login Account** → enter phone + OTP\n"
+            "Your account joins public FROM channels automatically\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "**📥 Add Channels**\n"
+            "`@username` · `t.me/link` · `-1001234567890`\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "**📋 Commands**\n"
+            "/start · /myplan · /plan · /help · /cancel\n\n"
+            "For the full guide use /help"
         )
         btns = [[Button.inline("🏠 Main Menu", b"main_menu")]]
         await _edit_or_respond(event, text, btns)
@@ -622,6 +770,52 @@ async def on_callback(event):
         )
         await show_filters(event, uid, setup_id)
 
+    # ── Login / Logout ────────────────────────────────────────────────────
+    elif data == "login_start":
+        if uid in user_clients:
+            await event.answer("✅ Already logged in!", alert=True)
+            return
+        if uid in login_clients:
+            await event.answer("⏳ Login already in progress.", alert=True)
+            return
+        set_state(uid, S_WAIT_PHONE)
+        await _edit_or_respond(
+            event,
+            "🔑 **Login with Your Telegram Account**\n\n"
+            "This allows the bot to join public channels on your behalf — "
+            "so you don't need to make the bot admin in FROM channels.\n\n"
+            "Please send your **phone number** with country code:\n"
+            "_Example: +919876543210_\n\n"
+            "⚠️ Your session is stored securely. Use **Logout** anytime to remove it.",
+            [[Button.inline("❌ Cancel", b"main_menu")]]
+        )
+
+    elif data == "logout_confirm":
+        if uid not in user_clients:
+            await event.answer("No active session.", alert=True)
+            return
+        await _edit_or_respond(
+            event,
+            "🔴 **Logout Confirmation**\n\n"
+            "Are you sure you want to log out?\n"
+            "Your Telegram account session will be deleted from the bot.",
+            [
+                [Button.inline("✅ Yes, Logout", b"logout_ok"),
+                 Button.inline("❌ Cancel",      b"main_menu")],
+            ]
+        )
+
+    elif data == "logout_ok":
+        try:
+            client = user_clients.pop(uid, None)
+            if client:
+                await client.disconnect()
+        except Exception:
+            pass
+        await sessions_col.delete_one({"user_id": uid})
+        await event.answer("✅ Logged out successfully!")
+        await show_main_menu(event, uid, edit=True)
+
     # ── Admin panel ────────────────────────────────────────────────────────
     elif data == "admin_panel":
         await show_admin_panel(event, uid)
@@ -785,6 +979,115 @@ async def on_text(event):
             buttons=[[Button.inline("◀️ Admin Panel", b"admin_panel")]]
         )
 
+    # ── Login: phone number ──────────────────────────────────────────────
+    elif state == S_WAIT_PHONE:
+        phone = text.strip()
+        if not phone.startswith("+"):
+            await event.respond("❌ Phone must start with country code, e.g. **+919876543210**",
+                                parse_mode="md")
+            return
+        wait_msg = await event.respond("⏳ Sending OTP...")
+        try:
+            tmp = TelegramClient(StringSession(), APP_ID, API_HASH)
+            await tmp.connect()
+            result = await tmp.send_code_request(phone)
+            login_clients[uid] = tmp
+            set_state(uid, S_WAIT_OTP, {"phone": phone, "phone_code_hash": result.phone_code_hash})
+            await wait_msg.edit(
+                "📱 **OTP Sent!**\n\n"
+                "Enter the **verification code** you received on Telegram:\n"
+                "_Example: 12345_\n\n"
+                "Send /cancel to abort.",
+                parse_mode="md"
+            )
+        except Exception as e:
+            login_clients.pop(uid, None)
+            clear_state(uid)
+            await wait_msg.edit(f"❌ Failed to send OTP: {str(e)[:200]}\n\nTry again with /start.",
+                                parse_mode="md")
+
+    # ── Login: OTP code ───────────────────────────────────────────────────
+    elif state == S_WAIT_OTP:
+        code  = text.strip().replace(" ", "")
+        phone = data.get("phone")
+        pch   = data.get("phone_code_hash")
+        tmp   = login_clients.get(uid)
+        if not tmp:
+            clear_state(uid)
+            await event.respond("❌ Session expired. Please start again with /start.")
+            return
+        try:
+            await tmp.sign_in(phone, code, phone_code_hash=pch)
+            # Save session
+            session_str = tmp.session.save()
+            await sessions_col.update_one(
+                {"user_id": uid},
+                {"$set": {"user_id": uid, "session_string": session_str, "phone": phone}},
+                upsert=True
+            )
+            user_clients[uid] = tmp
+            login_clients.pop(uid, None)
+            clear_state(uid)
+            # Auto-join any existing public FROM channels for this user
+            asyncio.create_task(_join_public_channels_for_user(uid, tmp))
+            await event.respond(
+                "✅ **Login Successful!**\n\n"
+                "Your account is now connected. Public FROM channels will be "
+                "auto-joined by your account — no bot admin needed.\n\n"
+                "Tap **🔴 Logout Account** on the main menu to disconnect anytime.",
+                parse_mode="md",
+                buttons=[[Button.inline("🏠 Main Menu", b"main_menu")]]
+            )
+        except PhoneCodeInvalidError:
+            await event.respond("❌ Wrong OTP. Please try again:")
+        except PhoneCodeExpiredError:
+            login_clients.pop(uid, None)
+            clear_state(uid)
+            await event.respond("❌ OTP expired. Please start login again from /start.")
+        except SessionPasswordNeededError:
+            set_state(uid, S_WAIT_2FA, {"phone": phone, "phone_code_hash": pch})
+            await event.respond(
+                "🔒 **Two-Factor Authentication Required**\n\n"
+                "Your account has 2FA enabled. Please enter your **cloud password**:",
+                parse_mode="md"
+            )
+        except Exception as e:
+            login_clients.pop(uid, None)
+            clear_state(uid)
+            await event.respond(f"❌ Login failed: {str(e)[:200]}\n\nTry again from /start.")
+
+    # ── Login: 2FA password ───────────────────────────────────────────────
+    elif state == S_WAIT_2FA:
+        password = text.strip()
+        phone    = data.get("phone")
+        tmp      = login_clients.get(uid)
+        if not tmp:
+            clear_state(uid)
+            await event.respond("❌ Session expired. Please start again with /start.")
+            return
+        try:
+            await tmp.sign_in(password=password)
+            session_str = tmp.session.save()
+            await sessions_col.update_one(
+                {"user_id": uid},
+                {"$set": {"user_id": uid, "session_string": session_str, "phone": phone}},
+                upsert=True
+            )
+            user_clients[uid] = tmp
+            login_clients.pop(uid, None)
+            clear_state(uid)
+            asyncio.create_task(_join_public_channels_for_user(uid, tmp))
+            await event.respond(
+                "✅ **Login Successful!**\n\n"
+                "Your account is now connected.",
+                parse_mode="md",
+                buttons=[[Button.inline("🏠 Main Menu", b"main_menu")]]
+            )
+        except Exception as e:
+            login_clients.pop(uid, None)
+            clear_state(uid)
+            await event.respond(f"❌ 2FA failed: {str(e)[:200]}\n\nTry again from /start.")
+
     # ── Add/Remove premium ────────────────────────────────────────────────
     elif state == S_WAIT_PREMIUM_OP:
         if uid not in ADMINS:
@@ -924,6 +1227,10 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
             f"expires {exp_ist.strftime('%d %b %Y, %I:%M %p IST')}"
         )
 
+    # Auto-join public FROM channel via userbot if logged in
+    if ch_type == "public" and role == "from" and uid in user_clients:
+        asyncio.create_task(_userbot_join(uid, getattr(entity, "username", None) or ch_id))
+
     # Pending private channel
     warn = ""
     if ch_type == "private" and not bot_is_admin and role == "from":
@@ -939,6 +1246,13 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
     elif ch_type == "private" and not bot_is_admin and role == "to":
         warn = "\n\n⚠️ **Bot is not admin** in this channel! Make it admin so it can post."
 
+    # If public FROM channel and bot is NOT admin AND no userbot, warn user
+    if ch_type == "public" and role == "from" and not bot_is_admin and uid not in user_clients:
+        warn = (
+            "\n\n⚠️ **Bot is not admin in this channel.**\n"
+            "Option A: Make bot admin → instant real-time forwarding\n"
+            "Option B: Use /login with your Telegram account → no admin needed"
+        )
     type_icon = "🌐" if ch_type == "public" else "🔒"
     role_label = "📥 FROM" if role == "from" else "📤 TO"
     btns = [
@@ -1004,7 +1318,192 @@ async def do_forward(dest, msg, remove_tag: bool):
     else:
         await bot.forward_messages(dest, msg)
 
-# Private channel event handler
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  USERBOT ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+async def _userbot_join(user_id: int, identifier):
+    """Tell the user's client to join a public channel."""
+    client = user_clients.get(user_id)
+    if not client:
+        return
+    try:
+        from telethon.tl.functions.channels import JoinChannelRequest
+        entity = await client.get_entity(identifier)
+        await client(JoinChannelRequest(entity))
+        log.info(f"Userbot {user_id} joined channel {identifier}")
+    except Exception as e:
+        log.warning(f"Userbot join failed for {identifier}: {e}")
+
+async def _join_public_channels_for_user(user_id: int, client):
+    """After login, join all existing public FROM channels for this user."""
+    try:
+        setups = await setups_col.find({"owner": user_id}).to_list(100)
+        for s in setups:
+            pub_chs = await channels_col.find({
+                "setup_id": s["setup_id"], "role": "from", "ch_type": "public"
+            }).to_list(50)
+            for ch in pub_chs:
+                ident = ch.get("identifier") or ch["ch_id"]
+                await _userbot_join(user_id, ident)
+                await asyncio.sleep(1)
+    except Exception as e:
+        log.error(f"_join_public_channels_for_user: {e}")
+
+async def start_userbot(user_id: int, session_string: str) -> bool:
+    """Start a userbot client for a user and register its event handler."""
+    try:
+        client = TelegramClient(StringSession(session_string), APP_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            log.warning(f"Userbot session for {user_id} is no longer valid — removing.")
+            await sessions_col.delete_one({"user_id": user_id})
+            return False
+        user_clients[user_id] = client
+
+        @client.on(events.NewMessage())
+        async def _ub_on_msg(event):
+            if event.is_private:
+                return
+            raw_cid = str(event.chat_id)
+            short   = raw_cid[4:] if raw_cid.startswith("-100") else raw_cid
+
+            from_chs = await channels_col.find({
+                "ch_id": {"$in": [raw_cid, short]},
+                "role": "from", "ch_type": "public",
+            }).to_list(10)
+
+            for from_ch in from_chs:
+                setup_id = from_ch["setup_id"]
+                s = await setups_col.find_one({
+                    "setup_id": setup_id, "owner": user_id, "active": True
+                })
+                if not s:
+                    continue
+                if not await is_premium(user_id):
+                    continue
+                if await already_processed(event.message.id, raw_cid):
+                    continue
+                to_chs = await channels_col.find({
+                    "setup_id": setup_id, "role": "to"
+                }).to_list(20)
+                if not to_chs:
+                    continue
+                from_list = await channels_col.find({
+                    "setup_id": setup_id, "role": "from"
+                }).to_list(20)
+                from_ids = [c["ch_id"] for c in from_list]
+                try:
+                    idx = from_ids.index(from_ch["ch_id"])
+                except ValueError:
+                    idx = 0
+                target  = to_chs[min(idx, len(to_chs) - 1)]
+                filters = s.get("filters", DEFAULT_FILTERS)
+                remove_tag = filters.get("remove_forward_tag", False)
+
+                if not msg_passes_filters(event.message, filters):
+                    continue
+                try:
+                    dest = (int(target["ch_id"])
+                            if target["ch_id"].lstrip("-").isdigit()
+                            else target["identifier"])
+                    if remove_tag and not event.message.poll:
+                        if event.message.media:
+                            data = await event.message.download_media(bytes)
+                            await bot.send_file(dest, data,
+                                                caption=event.message.text or "")
+                        else:
+                            await bot.send_message(dest, event.message.text or "")
+                    else:
+                        from_ident = from_ch.get("identifier") or raw_cid
+                        await bot.forward_messages(dest, [event.message.id],
+                                                   from_peer=from_ident)
+                    await mark_processed(event.message.id, raw_cid)
+                    await channels_col.update_one(
+                        {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
+                        {"$set": {"last_msg_id": event.message.id}}
+                    )
+                except Exception as e:
+                    log.error(f"Userbot forward error: {e}")
+
+        asyncio.create_task(client.run_until_disconnected())
+        log.info(f"Userbot started for user {user_id}")
+        return True
+    except Exception as e:
+        log.error(f"start_userbot failed for {user_id}: {e}")
+        user_clients.pop(user_id, None)
+        return False
+
+async def load_all_userbots():
+    """Called at startup — restore all saved sessions."""
+    docs = await sessions_col.find({}).to_list(1000)
+    for doc in docs:
+        uid = doc["user_id"]
+        ok  = await start_userbot(uid, doc["session_string"])
+        if ok:
+            log.info(f"Restored userbot session for user {uid}")
+        await asyncio.sleep(0.5)
+
+async def task_check_channels():
+    """Hourly health-check: if a FROM public channel is inaccessible
+    3 consecutive times (via userbot entity lookup), auto-remove it."""
+    await asyncio.sleep(3600)
+    while True:
+        try:
+            pub_chs = await channels_col.find({
+                "role": "from", "ch_type": "public"
+            }).to_list(500)
+            for ch in pub_chs:
+                setup_id = ch["setup_id"]
+                s = await setups_col.find_one({"setup_id": setup_id})
+                if not s:
+                    continue
+                owner  = s["owner"]
+                ident  = ch.get("identifier") or ch["ch_id"]
+                client = user_clients.get(owner) or bot
+                try:
+                    await client.get_entity(ident)
+                    # Accessible — reset fail count
+                    if ch.get("fail_count", 0) > 0:
+                        await channels_col.update_one(
+                            {"ch_id": ch["ch_id"], "setup_id": setup_id},
+                            {"$set": {"fail_count": 0}}
+                        )
+                except (ChannelPrivateError, UsernameNotOccupiedError,
+                        UsernameInvalidError):
+                    fail = ch.get("fail_count", 0) + 1
+                    log.warning(f"Channel {ident} health-check fail {fail}/3")
+                    await channels_col.update_one(
+                        {"ch_id": ch["ch_id"], "setup_id": setup_id},
+                        {"$set": {"fail_count": fail}}
+                    )
+                    if fail >= 3:
+                        await channels_col.delete_one({
+                            "ch_id": ch["ch_id"], "setup_id": setup_id
+                        })
+                        try:
+                            await bot.send_message(
+                                owner,
+                                f"⚠️ **Channel Auto-Removed**\n\n"
+                                f"**{ch.get('title', ident)}** became inaccessible "
+                                f"(checked 3 times) and was removed from setup "
+                                f"**{s.get('name')}**.",
+                                parse_mode="md",
+                                buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass  # Transient errors do not affect fail count
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            log.error(f"task_check_channels: {e}")
+        await asyncio.sleep(3600)
+
+# Real-time event handler — handles BOTH public and private FROM channels.
+# For public channels the bot MUST be admin in the FROM channel so that
+# Telegram delivers NewMessage events to it.
+# For private channels the bot must also be admin.
 @bot.on(events.NewMessage())
 async def on_new_msg(event):
     if event.is_private:
@@ -1013,9 +1512,10 @@ async def on_new_msg(event):
     # Fix: use slicing instead of lstrip("100") which strips individual chars
     short   = raw_cid[4:] if raw_cid.startswith("-100") else raw_cid
 
+    # Match against BOTH public and private FROM channels
     from_chs = await channels_col.find({
         "ch_id": {"$in": [raw_cid, short]},
-        "role": "from", "ch_type": "private"
+        "role": "from",
     }).to_list(10)
 
     for from_ch in from_chs:
@@ -1047,105 +1547,24 @@ async def on_new_msg(event):
                 dest = int(target["ch_id"]) if target["ch_id"].lstrip("-").isdigit() else target["identifier"]
                 await do_forward(dest, event.message, remove_tag)
                 await mark_processed(event.message.id, raw_cid)
+                # Keep last_msg_id in sync so the polling fallback does not re-send
+                await channels_col.update_one(
+                    {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
+                    {"$set": {"last_msg_id": event.message.id}}
+                )
             except Exception as e:
-                log.error(f"Private forward error: {e}")
+                log.error(f"Forward error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BACKGROUND TASKS
 # ─────────────────────────────────────────────────────────────────────────────
 async def task_poll_public():
-    await asyncio.sleep(5)
-    while True:
-        try:
-            active = await setups_col.find({"active": True}).to_list(200)
-            for s in active:
-                owner = s["owner"]
-                if not await is_premium(owner):
-                    continue
-                sid     = s["setup_id"]
-                filters = s.get("filters", DEFAULT_FILTERS)
-                from_chs = await channels_col.find(
-                    {"setup_id": sid, "role": "from", "ch_type": "public"}
-                ).to_list(20)
-                to_chs = await channels_col.find(
-                    {"setup_id": sid, "role": "to"}
-                ).to_list(20)
-                if not from_chs or not to_chs:
-                    continue
-
-                for i, fc in enumerate(from_chs):
-                    ident   = fc.get("identifier") or fc["ch_id"]
-                    last_id = fc.get("last_msg_id", 0)
-                    target  = to_chs[min(i, len(to_chs) - 1)]
-                    remove_tag = filters.get("remove_forward_tag", False)
-                    try:
-                        msgs = await bot.get_messages(ident, min_id=last_id, limit=50)
-                        if not msgs:
-                            # No new messages — reset fail_count in case it drifted up
-                            # from a previous transient error
-                            if fc.get("fail_count", 0) > 0:
-                                await channels_col.update_one(
-                                    {"ch_id": fc["ch_id"], "setup_id": sid},
-                                    {"$set": {"fail_count": 0}}
-                                )
-                            continue
-                        msgs = sorted(msgs, key=lambda m: m.id)
-                        new_last = last_id
-                        for msg in msgs:
-                            if await already_processed(msg.id, fc["ch_id"]):
-                                continue
-                            if msg_passes_filters(msg, filters):
-                                try:
-                                    dest = (int(target["ch_id"])
-                                            if target["ch_id"].lstrip("-").isdigit()
-                                            else target["identifier"])
-                                    await do_forward(dest, msg, remove_tag)
-                                    await mark_processed(msg.id, fc["ch_id"])
-                                    await asyncio.sleep(0.5)
-                                except FloodWaitError as e:
-                                    await asyncio.sleep(e.seconds + 1)
-                                except Exception as e:
-                                    log.error(f"Poll fwd error: {e}")
-                            new_last = max(new_last, msg.id)
-                        if new_last > last_id:
-                            await channels_col.update_one(
-                                {"ch_id": fc["ch_id"], "setup_id": sid},
-                                {"$set": {"last_msg_id": new_last, "fail_count": 0}}
-                            )
-                    except (ChannelPrivateError, UsernameNotOccupiedError,
-                            UsernameInvalidError) as e:
-                        # Channel is confirmed gone / private — increment fail counter
-                        fail = fc.get("fail_count", 0) + 1
-                        log.warning(f"Public channel '{ident}' inaccessible (fail {fail}/3): {e}")
-                        await channels_col.update_one(
-                            {"ch_id": fc["ch_id"], "setup_id": sid},
-                            {"$set": {"fail_count": fail}}
-                        )
-                        if fail >= 3:
-                            await channels_col.delete_one({"ch_id": fc["ch_id"], "setup_id": sid})
-                            try:
-                                await bot.send_message(
-                                    owner,
-                                    f"⚠️ **Channel Auto-Removed**\n\n"
-                                    f"**{fc.get('title', ident)}** became inaccessible "
-                                    f"(checked 3 times) and was removed from setup "
-                                    f"**{s.get('name')}**.",
-                                    parse_mode="md",
-                                    buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
-                                )
-                            except Exception:
-                                pass
-                    except FloodWaitError as e:
-                        # Telegram rate-limit — wait and do NOT touch fail_count
-                        log.warning(f"FloodWait {e.seconds}s while polling '{ident}'")
-                        await asyncio.sleep(e.seconds + 1)
-                    except Exception as e:
-                        # Any other transient error (network, timeout, etc.)
-                        # Log it but do NOT penalise the channel
-                        log.error(f"Transient poll error for '{ident}': {e}")
-        except Exception as e:
-            log.error(f"task_poll_public: {e}")
-        await asyncio.sleep(10)
+    # GetHistoryRequest (bot.get_messages) is permanently banned for bot accounts
+    # by Telegram — it raises BotMethodInvalidError every time regardless of
+    # admin status.  Public channel forwarding is handled in real-time by the
+    # on_new_msg event handler instead (bot must be admin in the FROM channel).
+    # This stub keeps the task alive so the start-up code does not need changes.
+    log.info("task_poll_public: polling disabled — using real-time events instead.")
 
 async def task_monitor_pending():
     await asyncio.sleep(15)
@@ -1254,9 +1673,11 @@ async def task_premium_expiry():
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
     log.info("ChannelAutoPost Bot started!")
+    await load_all_userbots()
     asyncio.create_task(task_poll_public())
     asyncio.create_task(task_monitor_pending())
     asyncio.create_task(task_premium_expiry())
+    asyncio.create_task(task_check_channels())
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
