@@ -1695,7 +1695,7 @@ async def _send_restart_notifications():
                     continue
                 try:
                     cid = ch["ch_id"]
-                    dest = ch.get("identifier") or (int(cid) if cid.startswith("-") else int("-100" + cid))
+                    dest = int(cid) if cid.startswith("-") else int("-100" + cid)
                     await bot.send_message(
                         dest,
                         "🔄 **ChannelAutoPost restarted.**\n\nForwarding is active.",
