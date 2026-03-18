@@ -59,6 +59,10 @@ PAYMENT_TEXT = config(
         "‼️ ᴀꜰᴛᴇʀ sᴇɴᴅɪɴɢ ᴀ sᴄʀᴇᴇɴsʜᴏᴛ ᴘʟᴇᴀsᴇ ɢɪᴠᴇ ᴜs sᴏᴍᴇ ᴛɪᴍᴇ ᴛᴏ ᴀᴅᴅ ʏᴏᴜ ɪɴ ᴛʜᴇ ᴘʀᴇᴍɪᴜᴍ</b>"
     )
 )
+# Fix literal \\n from .env and wrap in <b> if not already formatted
+PAYMENT_TEXT = PAYMENT_TEXT.replace("\\n", "\n")
+if not PAYMENT_TEXT.startswith("<b>"):
+    PAYMENT_TEXT = f"<b>{PAYMENT_TEXT}</b>"
 
 # ── Database ──────────────────────────────────────────────────────────────────
 _db_client    = AsyncIOMotorClient(MONGO_URI)
@@ -246,8 +250,6 @@ async def show_setup_detail(event, uid, setup_id):
         "Use the buttons to manage this setup:"
     )
     toggle_label = "⏸ Pause" if s.get("active") else "▶️ Activate"
-    no_fwd_tag   = s.get("no_forward_tag", False)
-    nft_label    = "🔕 Copy Mode: ON (No Tag)" if no_fwd_tag else "🔔 Copy Mode: OFF (With Tag)"
     btns = [
         [Button.inline("📥 FROM Channels", f"ch_list:from:{setup_id}".encode()),
          Button.inline("📤 TO Channels",   f"ch_list:to:{setup_id}".encode())],
@@ -255,7 +257,6 @@ async def show_setup_detail(event, uid, setup_id):
          Button.inline("➕ Add TO",        f"add_ch:to:{setup_id}".encode())],
         [Button.inline("🎛 Filters",       f"filters:{setup_id}".encode()),
          Button.inline(toggle_label,       f"toggle_setup:{setup_id}".encode())],
-        [Button.inline(nft_label,          f"toggle_no_fwd_tag:{setup_id}".encode())],
         [Button.inline("✏️ Rename",        f"rename_setup:{setup_id}".encode()),
          Button.inline("🗑 Delete",        f"del_setup_ask:{setup_id}".encode())],
         [Button.inline("◀️ My Setups",     b"setups_list")],
@@ -614,17 +615,6 @@ async def on_callback(event):
         )
         await show_filters(event, uid, setup_id)
 
-    elif data.startswith("toggle_no_fwd_tag:"):
-        setup_id = data.split(":", 1)[1]
-        s = await setups_col.find_one({"setup_id": setup_id, "owner": uid})
-        if s:
-            new_val = not s.get("no_forward_tag", False)
-            await setups_col.update_one(
-                {"setup_id": setup_id}, {"$set": {"no_forward_tag": new_val}}
-            )
-            msg_txt = "🔕 Copy Mode ON — ফরওয়ার্ড ট্যাগ আসবে না!" if new_val else "🔔 Copy Mode OFF — ফরওয়ার্ড ট্যাগ দেখাবে!"
-            await event.answer(msg_txt, alert=False)
-            await show_setup_detail(event, uid, setup_id)
     # ── Admin panel ────────────────────────────────────────────────────────
     elif data == "admin_panel":
         await show_admin_panel(event, uid)
@@ -960,23 +950,6 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
 # ─────────────────────────────────────────────────────────────────────────────
 #  FORWARDING ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
-async def copy_message(dest, msg):
-    """forward tag ছাড়া মেসেজ কপি করে পাঠায়।"""
-    try:
-        if msg.media:
-            await bot.send_file(
-                dest, msg.media,
-                caption=msg.message or "",
-                formatting_entities=msg.entities,
-            )
-        else:
-            await bot.send_message(
-                dest, msg.message or "",
-                formatting_entities=msg.entities,
-            )
-    except Exception as e:
-        raise e
-
 def msg_passes_filters(msg, filters):
     if msg.forward and not filters.get("forward", True): return False
     if msg.text and not msg.media and not filters.get("text", True): return False
@@ -1006,10 +979,11 @@ async def on_new_msg(event):
     if event.is_private:
         return
     raw_cid = str(event.chat_id)
-    short   = raw_cid[4:] if raw_cid.startswith("-100") else raw_cid
+    short   = raw_cid.lstrip("-").lstrip("100") if raw_cid.startswith("-100") else raw_cid
+
     from_chs = await channels_col.find({
         "ch_id": {"$in": [raw_cid, short]},
-        "role": "from"
+        "role": "from", "ch_type": "private"
     }).to_list(10)
 
     for from_ch in from_chs:
@@ -1038,10 +1012,7 @@ async def on_new_msg(event):
         if msg_passes_filters(event.message, filters):
             try:
                 dest = int(target["ch_id"]) if target["ch_id"].lstrip("-").isdigit() else target["identifier"]
-                if s.get("no_forward_tag"):
-                    await copy_message(dest, event.message)
-                else:
-                    await bot.forward_messages(dest, event.message)
+                await bot.forward_messages(dest, event.message)
                 await mark_processed(event.message.id, raw_cid)
             except Exception as e:
                 log.error(f"Private forward error: {e}")
@@ -1087,10 +1058,7 @@ async def task_poll_public():
                                     dest = (int(target["ch_id"])
                                             if target["ch_id"].lstrip("-").isdigit()
                                             else target["identifier"])
-                                    if s.get("no_forward_tag"):
-                                        await copy_message(dest, msg)
-                                    else:
-                                        await bot.forward_messages(dest, msg)
+                                    await bot.forward_messages(dest, msg)
                                     await mark_processed(msg.id, fc["ch_id"])
                                     await asyncio.sleep(0.5)
                                 except FloodWaitError as e:
