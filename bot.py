@@ -103,6 +103,7 @@ DEFAULT_FILTERS = {
     "text": True, "photo": True, "video": True, "document": True,
     "audio": True, "sticker": True, "gif": True, "voice": True,
     "video_note": True, "poll": False, "forward": True,
+    "remove_forward_tag": False,
 }
 
 async def get_setting(key, default=None):
@@ -290,17 +291,18 @@ async def show_channel_list(event, uid, setup_id, role):
     await _edit_or_respond(event, text, btns)
 
 FILTER_LABELS = {
-    "text":       "📝 Text",
-    "photo":      "🖼 Photo",
-    "video":      "🎬 Video",
-    "document":   "📄 Document",
-    "audio":      "🎵 Audio",
-    "sticker":    "🎭 Sticker",
-    "gif":        "🎞 GIF",
-    "voice":      "🎤 Voice",
-    "video_note": "⭕ Round",
-    "poll":       "📊 Poll",
-    "forward":    "🔁 Forwarded",
+    "text":               "📝 Text",
+    "photo":              "🖼 Photo",
+    "video":              "🎬 Video",
+    "document":           "📄 Document",
+    "audio":              "🎵 Audio",
+    "sticker":            "🎭 Sticker",
+    "gif":                "🎞 GIF",
+    "voice":              "🎤 Voice",
+    "video_note":         "⭕ Round",
+    "poll":               "📊 Poll",
+    "forward":            "🔁 Forwarded",
+    "remove_forward_tag": "🚫 Remove Fwd Tag",
 }
 
 async def show_filters(event, uid, setup_id):
@@ -309,7 +311,12 @@ async def show_filters(event, uid, setup_id):
         await event.answer("Setup not found!", alert=True)
         return
     filters = s.get("filters", DEFAULT_FILTERS.copy())
-    text = f"🎛 **Filters — {s.get('name')}**\n\nToggle which types to forward:"
+    text = (
+        f"🎛 **Filters — {s.get('name')}**\n\n"
+        "Toggle which message types to forward.\n"
+        "🚫 **Remove Fwd Tag** — copies messages instead of forwarding "
+        "(hides the 'Forwarded from …' header)."
+    )
     btns = []
     keys = list(FILTER_LABELS.keys())
     for i in range(0, len(keys), 2):
@@ -672,7 +679,7 @@ async def on_callback(event):
 # ─────────────────────────────────────────────────────────────────────────────
 #  TEXT INPUT HANDLER (FSM)
 # ─────────────────────────────────────────────────────────────────────────────
-@bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith("/")))
+@bot.on(events.NewMessage(func=lambda e: e.is_private and not (e.message.text or "").startswith("/")))
 async def on_text(event):
     uid   = event.sender_id
     text  = event.message.text.strip()
@@ -951,11 +958,23 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
 #  FORWARDING ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 def msg_passes_filters(msg, filters):
+    # "remove_forward_tag" is a behaviour modifier, not a blocker — skip it here.
     if msg.forward and not filters.get("forward", True): return False
     if msg.text and not msg.media and not filters.get("text", True): return False
     if msg.photo and not filters.get("photo", True): return False
     if msg.video and not filters.get("video", True): return False
-    if msg.document and not filters.get("document", True): return False
+    # Document check must exclude all specialised media types that Telethon
+    # also exposes as msg.document (video, audio, voice, sticker, gif, video_note).
+    is_plain_doc = (
+        msg.document
+        and not msg.video
+        and not msg.audio
+        and not msg.voice
+        and not msg.sticker
+        and not msg.gif
+        and not msg.video_note
+    )
+    if is_plain_doc and not filters.get("document", True): return False
     if msg.audio and not filters.get("audio", True): return False
     if msg.sticker and not filters.get("sticker", True): return False
     if msg.gif and not filters.get("gif", True): return False
@@ -973,13 +992,26 @@ async def mark_processed(msg_id, ch_id):
         {"$set": {"ts": datetime.utcnow()}}, upsert=True
     )
 
+async def do_forward(dest, msg, remove_tag: bool):
+    """Forward a message to dest.  When remove_tag is True the message is
+    copied (no 'Forwarded from …' header).  Polls cannot be copied so they
+    always fall back to a real forward."""
+    if remove_tag and not msg.poll:
+        if msg.media:
+            await bot.send_file(dest, msg.media, caption=msg.text or "")
+        else:
+            await bot.send_message(dest, msg.text or "")
+    else:
+        await bot.forward_messages(dest, msg)
+
 # Private channel event handler
 @bot.on(events.NewMessage())
 async def on_new_msg(event):
     if event.is_private:
         return
     raw_cid = str(event.chat_id)
-    short   = raw_cid.lstrip("-").lstrip("100") if raw_cid.startswith("-100") else raw_cid
+    # Fix: use slicing instead of lstrip("100") which strips individual chars
+    short   = raw_cid[4:] if raw_cid.startswith("-100") else raw_cid
 
     from_chs = await channels_col.find({
         "ch_id": {"$in": [raw_cid, short]},
@@ -1008,11 +1040,12 @@ async def on_new_msg(event):
             idx = 0
         target = to_chs[min(idx, len(to_chs) - 1)]
         filters = s.get("filters", DEFAULT_FILTERS)
+        remove_tag = filters.get("remove_forward_tag", False)
 
         if msg_passes_filters(event.message, filters):
             try:
                 dest = int(target["ch_id"]) if target["ch_id"].lstrip("-").isdigit() else target["identifier"]
-                await bot.forward_messages(dest, event.message)
+                await do_forward(dest, event.message, remove_tag)
                 await mark_processed(event.message.id, raw_cid)
             except Exception as e:
                 log.error(f"Private forward error: {e}")
@@ -1044,9 +1077,17 @@ async def task_poll_public():
                     ident   = fc.get("identifier") or fc["ch_id"]
                     last_id = fc.get("last_msg_id", 0)
                     target  = to_chs[min(i, len(to_chs) - 1)]
+                    remove_tag = filters.get("remove_forward_tag", False)
                     try:
                         msgs = await bot.get_messages(ident, min_id=last_id, limit=50)
                         if not msgs:
+                            # No new messages — reset fail_count in case it drifted up
+                            # from a previous transient error
+                            if fc.get("fail_count", 0) > 0:
+                                await channels_col.update_one(
+                                    {"ch_id": fc["ch_id"], "setup_id": sid},
+                                    {"$set": {"fail_count": 0}}
+                                )
                             continue
                         msgs = sorted(msgs, key=lambda m: m.id)
                         new_last = last_id
@@ -1058,7 +1099,7 @@ async def task_poll_public():
                                     dest = (int(target["ch_id"])
                                             if target["ch_id"].lstrip("-").isdigit()
                                             else target["identifier"])
-                                    await bot.forward_messages(dest, msg)
+                                    await do_forward(dest, msg, remove_tag)
                                     await mark_processed(msg.id, fc["ch_id"])
                                     await asyncio.sleep(0.5)
                                 except FloodWaitError as e:
@@ -1071,8 +1112,11 @@ async def task_poll_public():
                                 {"ch_id": fc["ch_id"], "setup_id": sid},
                                 {"$set": {"last_msg_id": new_last, "fail_count": 0}}
                             )
-                    except Exception as e:
+                    except (ChannelPrivateError, UsernameNotOccupiedError,
+                            UsernameInvalidError) as e:
+                        # Channel is confirmed gone / private — increment fail counter
                         fail = fc.get("fail_count", 0) + 1
+                        log.warning(f"Public channel '{ident}' inaccessible (fail {fail}/3): {e}")
                         await channels_col.update_one(
                             {"ch_id": fc["ch_id"], "setup_id": sid},
                             {"$set": {"fail_count": fail}}
@@ -1083,13 +1127,22 @@ async def task_poll_public():
                                 await bot.send_message(
                                     owner,
                                     f"⚠️ **Channel Auto-Removed**\n\n"
-                                    f"**{fc.get('title', ident)}** failed 3 times and was removed "
-                                    f"from setup **{s.get('name')}**.",
+                                    f"**{fc.get('title', ident)}** became inaccessible "
+                                    f"(checked 3 times) and was removed from setup "
+                                    f"**{s.get('name')}**.",
                                     parse_mode="md",
                                     buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
                                 )
                             except Exception:
                                 pass
+                    except FloodWaitError as e:
+                        # Telegram rate-limit — wait and do NOT touch fail_count
+                        log.warning(f"FloodWait {e.seconds}s while polling '{ident}'")
+                        await asyncio.sleep(e.seconds + 1)
+                    except Exception as e:
+                        # Any other transient error (network, timeout, etc.)
+                        # Log it but do NOT penalise the channel
+                        log.error(f"Transient poll error for '{ident}': {e}")
         except Exception as e:
             log.error(f"task_poll_public: {e}")
         await asyncio.sleep(10)
@@ -1106,6 +1159,11 @@ async def task_monitor_pending():
                 uid      = p["uid"]
                 ch       = await channels_col.find_one({"ch_id": ch_id, "setup_id": setup_id})
                 if ch:
+                    # Public channels never need the bot to be admin —
+                    # they are handled by the polling task, not pending queue.
+                    if ch.get("ch_type") == "public":
+                        await pending_col.delete_one({"_id": p["_id"]})
+                        continue
                     # Check if bot is now admin
                     try:
                         me = await bot.get_me()
