@@ -1256,7 +1256,7 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
     # Send init message to TO channel so bot caches the entity
     if role == "to" and bot_is_admin:
         try:
-            dest = int(ch_id) if ch_id.lstrip("-").isdigit() else getattr(entity, "username", None)
+            dest = getattr(entity, "username", None) or (int(ch_id) if ch_id.startswith("-") else int("-100" + ch_id))
             await bot.send_message(
                 dest,
                 "✅ **ChannelAutoPost connected!**\n\n"
@@ -1694,7 +1694,8 @@ async def _send_restart_notifications():
                 if ch["ch_id"] in notified:
                     continue
                 try:
-                    dest = int(ch["ch_id"]) if ch["ch_id"].lstrip("-").isdigit() else ch.get("identifier")
+                    cid = ch["ch_id"]
+                    dest = ch.get("identifier") or (int(cid) if cid.startswith("-") else int("-100" + cid))
                     await bot.send_message(
                         dest,
                         "🔄 **ChannelAutoPost restarted.**\n\nForwarding is active.",
