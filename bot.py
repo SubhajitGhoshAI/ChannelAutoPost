@@ -1253,6 +1253,19 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
             "Option A: Make bot admin → instant real-time forwarding\n"
             "Option B: Use /login with your Telegram account → no admin needed"
         )
+    # Send init message to TO channel so bot caches the entity
+    if role == "to" and bot_is_admin:
+        try:
+            dest = int(ch_id) if ch_id.lstrip("-").isdigit() else getattr(entity, "username", None)
+            await bot.send_message(
+                dest,
+                "✅ **ChannelAutoPost connected!**\n\n"
+                "This channel is now set as a destination (TO) channel.\n"
+                "Forwarding will begin as soon as a FROM channel posts.",
+                parse_mode="md"
+            )
+        except Exception as e:
+            log.warning(f"Init message failed for TO channel {ch_id}: {e}")
     type_icon = "🌐" if ch_type == "public" else "🔒"
     role_label = "📥 FROM" if role == "from" else "📤 TO"
     btns = [
@@ -1667,12 +1680,40 @@ async def task_premium_expiry():
             log.error(f"task_premium_expiry: {e}")
         await asyncio.sleep(3600)
 
+async def _send_restart_notifications():
+    """On restart, send a message to all active TO channels to warm up entity cache."""
+    await asyncio.sleep(3)
+    try:
+        active_setups = await setups_col.find({"active": True}).to_list(200)
+        notified = set()
+        for s in active_setups:
+            to_chs = await channels_col.find(
+                {"setup_id": s["setup_id"], "role": "to"}
+            ).to_list(20)
+            for ch in to_chs:
+                if ch["ch_id"] in notified:
+                    continue
+                try:
+                    dest = int(ch["ch_id"]) if ch["ch_id"].lstrip("-").isdigit() else ch.get("identifier")
+                    await bot.send_message(
+                        dest,
+                        "🔄 **ChannelAutoPost restarted.**\n\nForwarding is active.",
+                        parse_mode="md"
+                    )
+                    notified.add(ch["ch_id"])
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    log.warning(f"Restart notify failed for {ch.get('identifier', ch['ch_id'])}: {e}")
+    except Exception as e:
+        log.error(f"_send_restart_notifications: {e}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
     log.info("ChannelAutoPost Bot started!")
+    asyncio.create_task(_send_restart_notifications())
     await load_all_userbots()
     asyncio.create_task(task_poll_public())
     asyncio.create_task(task_monitor_pending())
