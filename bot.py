@@ -1537,15 +1537,13 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                             else target["identifier"])
                     if remove_tag and not event.message.poll:
                         if event.message.media:
-                            data = await event.message.download_media(bytes)
-                            await bot.send_file(dest, data,
-                                                caption=event.message.text or "")
+                            await client.send_file(dest, event.message.media,
+                                                   caption=event.message.text or "")
                         else:
-                            await bot.send_message(dest, event.message.text or "")
+                            await client.send_message(dest, event.message.text or "")
                     else:
-                        from_ident = from_ch.get("identifier") or raw_cid
-                        await bot.forward_messages(dest, [event.message.id],
-                                                   from_peer=from_ident)
+                        await client.forward_messages(dest, [event.message.id],
+                                                      from_peer=raw_cid)
                     await mark_processed(event.message.id, raw_cid)
                     await channels_col.update_one(
                         {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
