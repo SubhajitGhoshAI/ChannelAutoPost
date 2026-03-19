@@ -172,16 +172,24 @@ async def check_force_sub(user_id):
     unjoined = []
     for ch in FORCE_SUB:
         try:
-            entity = await bot.get_entity(ch)
-            participant = await bot.get_permissions(entity, user_id)
-            if not participant.is_member and not participant.is_admin:
+            # Support both channel ID (numeric) and username
+            resolved = int(ch) if ch.lstrip("-").isdigit() else ch
+            entity = await bot.get_entity(resolved)
+            try:
+                participant = await bot.get_permissions(entity, user_id)
+                is_joined = participant.is_member or participant.is_admin
+            except Exception:
+                is_joined = False
+            if not is_joined:
                 try:
                     from telethon.tl.functions.messages import ExportChatInviteRequest
                     inv = await bot(ExportChatInviteRequest(entity))
                     link = inv.link
                 except Exception:
-                    link = f"https://t.me/{ch.lstrip('@')}"
-                unjoined.append((getattr(entity, "title", ch), link))
+                    username = getattr(entity, "username", None)
+                    link = f"https://t.me/{username}" if username else None
+                if link:
+                    unjoined.append((getattr(entity, "title", str(ch)), link))
         except Exception:
             pass
     return unjoined
