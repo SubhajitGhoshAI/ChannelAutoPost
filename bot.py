@@ -730,8 +730,10 @@ async def on_callback(event):
     elif data.startswith("add_ch:"):
         _, role, setup_id = data.split(":", 2)
         if not await is_premium(uid):
-            await event.answer("⚠️ Premium required!", alert=True)
-            return
+            res = await try_start_trial(uid)
+            if not res:
+                await event.answer("⚠️ Premium required!", alert=True)
+                return
         state = S_WAIT_FROM_CH if role == "from" else S_WAIT_TO_CH
         set_state(uid, state, {"setup_id": setup_id})
         icon = "📥" if role == "from" else "📤"
