@@ -1532,9 +1532,14 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                 if not msg_passes_filters(event.message, filters):
                     continue
                 try:
-                    dest = (int(target["ch_id"])
-                            if target["ch_id"].lstrip("-").isdigit()
-                            else target["identifier"])
+                    ch_id_str = target["ch_id"]
+                    if ch_id_str.lstrip("-").isdigit():
+                        cid = int(ch_id_str)
+                        if cid > 0:
+                            cid = int("-100" + ch_id_str)
+                        dest = cid
+                    else:
+                        dest = target["identifier"]
                     if remove_tag and not event.message.poll:
                         if event.message.media:
                             await client.send_file(dest, event.message.media,
