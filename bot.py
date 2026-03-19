@@ -1203,6 +1203,25 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
         except Exception:
             pass
 
+    # Block: public FROM + no admin + no userbot = impossible, don't even save
+    if ch_type == "public" and role == "from" and not bot_is_admin and uid not in user_clients:
+        await wait.edit(
+            f"⛔ **Channel Not Added**\n\n"
+            f"**{title}** is a public FROM channel, but:\n"
+            "• Bot is **not admin** in this channel\n"
+            "• You are **not logged in**\n\n"
+            "Without at least one of these, forwarding is **impossible** — "
+            "so the channel was **not saved**.\n\n"
+            "👇 Login with your Telegram account first, then add this channel again — "
+            "no admin access needed!",
+            parse_mode="md",
+            buttons=[
+                [Button.inline("🔑 Login Now", b"login_start")],
+                [Button.inline("◀️ Back to Setup", f"setup:{setup_id}".encode())],
+            ]
+        )
+        return
+
     await channels_col.insert_one({
         "ch_id":        ch_id,
         "setup_id":     setup_id,
@@ -1215,7 +1234,6 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
         "fail_count":   0,
         "added_at":     datetime.utcnow(),
     })
-
     # Free trial on first channel
     trial_note = ""
     res = await try_start_trial(uid)
