@@ -1555,8 +1555,8 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                             except Exception:
                                 await bot.send_message(dest, event.message.text or "")
                     else:
-                        await bot.forward_messages(dest, [event.message.id],
-                                                   from_peer=raw_cid)
+                        await client.forward_messages(dest, [event.message.id],
+                                                      from_peer=event.chat_id)
                     await mark_processed(event.message.id, raw_cid)
                     await channels_col.update_one(
                         {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
