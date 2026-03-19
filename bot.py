@@ -1122,11 +1122,11 @@ async def on_text(event):
                 {"$set": {"user_id": uid, "session_string": session_str, "phone": phone}},
                 upsert=True
             )
-            user_clients[uid] = tmp
             login_clients.pop(uid, None)
             clear_state(uid)
-            # Auto-join any existing public FROM channels for this user
-            asyncio.create_task(_join_public_channels_for_user(uid, tmp))
+            await tmp.disconnect()
+            await start_userbot(uid, session_str)
+            asyncio.create_task(_join_public_channels_for_user(uid, user_clients.get(uid)))
             await event.respond(
                 "✅ **Login Successful!**\n\n"
                 "Your account is now connected. Public FROM channels will be "
@@ -1170,10 +1170,11 @@ async def on_text(event):
                 {"$set": {"user_id": uid, "session_string": session_str, "phone": phone}},
                 upsert=True
             )
-            user_clients[uid] = tmp
             login_clients.pop(uid, None)
             clear_state(uid)
-            asyncio.create_task(_join_public_channels_for_user(uid, tmp))
+            await tmp.disconnect()
+            await start_userbot(uid, session_str)
+            asyncio.create_task(_join_public_channels_for_user(uid, user_clients.get(uid)))
             await event.respond(
                 "✅ **Login Successful!**\n\n"
                 "Your account is now connected.",
