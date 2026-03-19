@@ -169,25 +169,31 @@ async def try_start_trial(user_id):
 async def check_force_sub(user_id):
     if not FORCE_SUB:
         return []
+    from telethon.tl.functions.channels import GetParticipantRequest
+    from telethon.errors import UserNotParticipantError
     unjoined = []
     for ch in FORCE_SUB:
         try:
-            # Support both channel ID (numeric) and username
             resolved = int(ch) if ch.lstrip("-").isdigit() else ch
             entity = await bot.get_entity(resolved)
+            is_joined = False
             try:
-                participant = await bot.get_permissions(entity, user_id)
-                is_joined = participant.is_member or participant.is_admin
+                await bot(GetParticipantRequest(entity, user_id))
+                is_joined = True
+            except UserNotParticipantError:
+                is_joined = False
             except Exception:
                 is_joined = False
             if not is_joined:
-                try:
-                    from telethon.tl.functions.messages import ExportChatInviteRequest
-                    inv = await bot(ExportChatInviteRequest(entity))
-                    link = inv.link
-                except Exception:
-                    username = getattr(entity, "username", None)
-                    link = f"https://t.me/{username}" if username else None
+                username = getattr(entity, "username", None)
+                link = f"https://t.me/{username}" if username else None
+                if not link:
+                    try:
+                        from telethon.tl.functions.messages import ExportChatInviteRequest
+                        inv = await bot(ExportChatInviteRequest(entity))
+                        link = inv.link
+                    except Exception:
+                        pass
                 if link:
                     unjoined.append((getattr(entity, "title", str(ch)), link))
         except Exception:
@@ -558,6 +564,7 @@ async def on_callback(event):
         unjoined = await check_force_sub(uid)
         if unjoined:
             await event.answer("Please join required channels first!", alert=True)
+            await send_force_sub_msg(event, unjoined)
             return
 
     # ── Navigation ────────────────────────────────────────────────────────
@@ -885,10 +892,13 @@ async def on_callback(event):
 async def on_text(event):
     uid   = event.sender_id
     text  = event.message.text.strip()
+    unjoined = await check_force_sub(uid)
+    if unjoined:
+        await send_force_sub_msg(event, unjoined)
+        return
     st    = get_state(uid)
     state = st["state"]
     data  = st["data"]
-
     # ── Setup name / rename ───────────────────────────────────────────────
     if state == S_WAIT_SETUP_NAME:
         name = text[:40]
