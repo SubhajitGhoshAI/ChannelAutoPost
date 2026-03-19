@@ -1545,14 +1545,17 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                         else:
                             dest = target["identifier"]
                         if remove_tag and not event.message.poll:
-                            if event.message.media:
+                            from telethon.tl.types import MessageMediaWebPage
+                            if event.message.media and not isinstance(event.message.media, MessageMediaWebPage):
                                 try:
                                     await client.send_file(dest, event.message.media,
-                                                           caption=event.message.text or "")
+                                                           caption=event.message.text or "",
+                                                           force_document=False)
                                 except Exception:
                                     data = await client.download_media(event.message, bytes)
                                     await bot.send_file(dest, data,
-                                                        caption=event.message.text or "")
+                                                        caption=event.message.text or "",
+                                                        force_document=False)
                             else:
                                 try:
                                     await client.send_message(dest, event.message.text or "")
