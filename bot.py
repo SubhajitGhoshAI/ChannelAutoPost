@@ -1344,8 +1344,7 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
 
     # Auto-join public FROM channel via userbot if logged in
     if ch_type == "public" and role == "from" and uid in user_clients:
-        asyncio.create_task(_userbot_join(uid, getattr(entity, "username", None) or ch_id))
-
+        asyncio.create_task(_userbot_join(uid, getattr(entity, "username", None) or ch_id, ch_title=title, notify=True))
     # Pending private channel
     warn = ""
     if ch_type == "private" and not bot_is_admin and role == "from":
@@ -1358,8 +1357,8 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
             "Please make the bot **admin** in this channel within **15 minutes**, "
             "or it will be auto-removed."
         )
-    elif ch_type == "private" and not bot_is_admin and role == "to":
-        warn = "\n\n⚠️ **Bot is not admin** in this channel! Make it admin so it can post."
+    elif not bot_is_admin and role == "to":
+        warn = "\n\n⚠️ **Bot is not admin** in this channel! Please make the bot **admin** here so it can post messages."
 
     # If public FROM channel and bot is NOT admin AND no userbot, warn user
     if ch_type == "public" and role == "from" and not bot_is_admin and uid not in user_clients:
@@ -1450,7 +1449,7 @@ async def do_forward(dest, msg, remove_tag: bool):
 # ─────────────────────────────────────────────────────────────────────────────
 #  USERBOT ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
-async def _userbot_join(user_id: int, identifier):
+async def _userbot_join(user_id: int, identifier, ch_title: str = None, notify: bool = False):
     """Tell the user's client to join a public channel."""
     client = user_clients.get(user_id)
     if not client:
@@ -1462,6 +1461,19 @@ async def _userbot_join(user_id: int, identifier):
         log.info(f"Userbot {user_id} joined channel {identifier}")
     except Exception as e:
         log.warning(f"Userbot join failed for {identifier}: {e}")
+        if notify:
+            name = ch_title or str(identifier)
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"⚠️ **Auto-Join Failed**\n\n"
+                    f"Could not auto-join **{name}**.\n"
+                    f"Please join this channel **manually** with your Telegram account, "
+                    f"then forwarding will work automatically.",
+                    parse_mode="md"
+                )
+            except Exception:
+                pass
 
 async def _join_public_channels_for_user(user_id: int, client):
     """After login, join all existing public FROM channels for this user."""
@@ -1547,23 +1559,15 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                         if remove_tag and not event.message.poll:
                             from telethon.tl.types import MessageMediaWebPage
                             if event.message.media and not isinstance(event.message.media, MessageMediaWebPage):
-                                try:
-                                    await client.send_file(dest, event.message.media,
-                                                           caption=event.message.text or "",
-                                                           force_document=False)
-                                except Exception:
-                                    data = await client.download_media(event.message, bytes)
-                                    await bot.send_file(dest, data,
-                                                        caption=event.message.text or "",
-                                                        force_document=False)
+                                data = await client.download_media(event.message, bytes)
+                                await bot.send_file(dest, data,
+                                                    caption=event.message.text or "",
+                                                    force_document=False)
                             else:
-                                try:
-                                    await client.send_message(dest, event.message.text or "")
-                                except Exception:
-                                    await bot.send_message(dest, event.message.text or "")
+                                await bot.send_message(dest, event.message.text or "")
                         else:
-                            await client.forward_messages(dest, [event.message.id],
-                                                          from_peer=event.chat_id)
+                            await bot.forward_messages(dest, [event.message.id],
+                                                       from_peer=event.chat_id)
                         await mark_processed(event.message.id, raw_cid)
                         await channels_col.update_one(
                             {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
