@@ -552,6 +552,83 @@ async def cmd_help(event):
                         buttons=[[Button.inline("🏠 Main Menu", b"main_menu")]])
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  ADMIN COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.on(events.NewMessage(pattern=r"^/listpremium$", func=lambda e: e.is_private))
+async def cmd_listpremium(event):
+    uid = event.sender_id
+    if uid not in ADMINS:
+        await event.respond("❌ Not authorized!")
+        return
+    now = datetime.utcnow()
+    active_users = await users_col.find({
+        "premium_until": {"$gt": now}
+    }).to_list(500)
+    if not active_users:
+        await event.respond("📋 **Active Premium Users**\n\nNo active premium users found.")
+        return
+    lines = [f"👑 **Active Premium Users: {len(active_users)}**\n"]
+    for i, user in enumerate(active_users, 1):
+        uid_u       = user["user_id"]
+        days_left   = (user["premium_until"] - now).days
+        is_trial    = user.get("trial_used") and user.get("premium_until")
+        plan_icon   = "🆓" if is_trial else "💎"
+        user_setups = await setups_col.find({"owner": uid_u}).to_list(100)
+        setup_ids   = [s["setup_id"] for s in user_setups]
+        from_chs    = await channels_col.count_documents({"setup_id": {"$in": setup_ids}, "role": "from"})
+        to_chs      = await channels_col.count_documents({"setup_id": {"$in": setup_ids}, "role": "to"})
+        name        = user.get("first_name") or user.get("username") or str(uid_u)
+        lines.append(
+            f"{i}. {plan_icon} `{uid_u}` — **{name}**\n"
+            f"   ⚙️ Setups: {len(user_setups)} | 📥 FROM: {from_chs} | 📤 TO: {to_chs}\n"
+            f"   ⏳ Days Left: {days_left}"
+        )
+    await event.respond("\n\n".join(lines), parse_mode="md")
+
+@bot.on(events.NewMessage(pattern=r"^/status$", func=lambda e: e.is_private))
+async def cmd_status(event):
+    uid = event.sender_id
+    if uid not in ADMINS:
+        await event.respond("❌ Not authorized!")
+        return
+    now           = datetime.utcnow()
+    total_users   = await users_col.count_documents({})
+    active_prem   = await users_col.count_documents({"premium_until": {"$gt": now}})
+    trial_users   = await users_col.count_documents({
+        "trial_used": True, "premium_until": {"$gt": now}
+    })
+    paid_users    = active_prem - trial_users
+    expired       = await users_col.count_documents({
+        "premium_until": {"$lt": now, "$ne": None}
+    })
+    free_users    = total_users - active_prem - expired
+    total_setups  = await setups_col.count_documents({})
+    active_setups = await setups_col.count_documents({"active": True})
+    total_from    = await channels_col.count_documents({"role": "from"})
+    total_to      = await channels_col.count_documents({"role": "to"})
+    text = (
+        "📊 **Bot Status**\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👥 **Users**\n"
+        f"  • Total: **{total_users}**\n"
+        f"  • 💎 Paid Premium: **{paid_users}**\n"
+        f"  • 🆓 Free Trial: **{trial_users}**\n"
+        f"  • ❌ Expired: **{expired}**\n"
+        f"  • 🔵 Free (no trial): **{free_users}**\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚙️ **Setups**\n"
+        f"  • Total: **{total_setups}**\n"
+        f"  • ✅ Active: **{active_setups}**\n"
+        f"  • ⏸ Paused: **{total_setups - active_setups}**\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📡 **Channels**\n"
+        f"  • 📥 FROM Total: **{total_from}**\n"
+        f"  • 📤 TO Total: **{total_to}**"
+    )
+    await event.respond(text, parse_mode="md",
+                        buttons=[[Button.inline("🔧 Admin Panel", b"admin_panel")]])
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  CALLBACK QUERY HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
 @bot.on(events.CallbackQuery())
