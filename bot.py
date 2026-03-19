@@ -1525,46 +1525,49 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                     idx = from_ids.index(from_ch["ch_id"])
                 except ValueError:
                     idx = 0
-                target  = to_chs[min(idx, len(to_chs) - 1)]
                 filters = s.get("filters", DEFAULT_FILTERS)
                 remove_tag = filters.get("remove_forward_tag", False)
 
                 if not msg_passes_filters(event.message, filters):
                     continue
-                try:
-                    ch_id_str = target["ch_id"]
-                    if ch_id_str.lstrip("-").isdigit():
-                        cid = int(ch_id_str)
-                        if cid > 0:
-                            cid = int("-100" + ch_id_str)
-                        dest = cid
-                    else:
-                        dest = target["identifier"]
-                    if remove_tag and not event.message.poll:
-                        if event.message.media:
-                            try:
-                                await client.send_file(dest, event.message.media,
-                                                       caption=event.message.text or "")
-                            except Exception:
-                                data = await client.download_media(event.message, bytes)
-                                await bot.send_file(dest, data,
-                                                    caption=event.message.text or "")
+                if len(from_list) >= len(to_chs):
+                    targets = [to_chs[min(idx, len(to_chs) - 1)]]
+                else:
+                    targets = to_chs
+                for target in targets:
+                    try:
+                        ch_id_str = target["ch_id"]
+                        if ch_id_str.lstrip("-").isdigit():
+                            cid = int(ch_id_str)
+                            if cid > 0:
+                                cid = int("-100" + ch_id_str)
+                            dest = cid
                         else:
-                            try:
-                                await client.send_message(dest, event.message.text or "")
-                            except Exception:
-                                await bot.send_message(dest, event.message.text or "")
-                    else:
-                        await client.forward_messages(dest, [event.message.id],
-                                                      from_peer=event.chat_id)
-                    await mark_processed(event.message.id, raw_cid)
-                    await channels_col.update_one(
-                        {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
-                        {"$set": {"last_msg_id": event.message.id}}
-                    )
-                except Exception as e:
-                    log.error(f"Userbot forward error: {e}")
-
+                            dest = target["identifier"]
+                        if remove_tag and not event.message.poll:
+                            if event.message.media:
+                                try:
+                                    await client.send_file(dest, event.message.media,
+                                                           caption=event.message.text or "")
+                                except Exception:
+                                    data = await client.download_media(event.message, bytes)
+                                    await bot.send_file(dest, data,
+                                                        caption=event.message.text or "")
+                            else:
+                                try:
+                                    await client.send_message(dest, event.message.text or "")
+                                except Exception:
+                                    await bot.send_message(dest, event.message.text or "")
+                        else:
+                            await client.forward_messages(dest, [event.message.id],
+                                                          from_peer=event.chat_id)
+                        await mark_processed(event.message.id, raw_cid)
+                        await channels_col.update_one(
+                            {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
+                            {"$set": {"last_msg_id": event.message.id}}
+                        )
+                    except Exception as e:
+                        log.error(f"Userbot forward error: {e}")
         asyncio.create_task(client.run_until_disconnected())
         log.info(f"Userbot started for user {user_id}")
         return True
@@ -1677,22 +1680,25 @@ async def on_new_msg(event):
             idx = from_ids.index(from_ch["ch_id"])
         except ValueError:
             idx = 0
-        target = to_chs[min(idx, len(to_chs) - 1)]
         filters = s.get("filters", DEFAULT_FILTERS)
         remove_tag = filters.get("remove_forward_tag", False)
 
         if msg_passes_filters(event.message, filters):
-            try:
-                dest = int(target["ch_id"]) if target["ch_id"].lstrip("-").isdigit() else target["identifier"]
-                await do_forward(dest, event.message, remove_tag)
-                await mark_processed(event.message.id, raw_cid)
-                # Keep last_msg_id in sync so the polling fallback does not re-send
-                await channels_col.update_one(
-                    {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
-                    {"$set": {"last_msg_id": event.message.id}}
-                )
-            except Exception as e:
-                log.error(f"Forward error: {e}")
+            if len(from_list) >= len(to_chs):
+                targets = [to_chs[min(idx, len(to_chs) - 1)]]
+            else:
+                targets = to_chs
+            for target in targets:
+                try:
+                    dest = int(target["ch_id"]) if target["ch_id"].lstrip("-").isdigit() else target["identifier"]
+                    await do_forward(dest, event.message, remove_tag)
+                    await mark_processed(event.message.id, raw_cid)
+                    await channels_col.update_one(
+                        {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
+                        {"$set": {"last_msg_id": event.message.id}}
+                    )
+                except Exception as e:
+                    log.error(f"Forward error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BACKGROUND TASKS
