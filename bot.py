@@ -101,6 +101,69 @@ user_clients:  dict = {}
 # Temporary clients used during login before session is saved
 login_clients: dict = {}
 
+# ── Per-setup Forward Queues (each setup gets its own sequential queue) ────────
+setup_queues:  dict = {}   # {setup_id: asyncio.Queue}
+setup_workers: dict = {}   # {setup_id: asyncio.Task}
+
+async def _setup_forward_worker(setup_id: str):
+    """One worker per setup — sequential, 2s gap, never misses a message."""
+    q = setup_queues[setup_id]
+    while True:
+        try:
+            item        = await q.get()
+            dest        = item["dest"]
+            msg         = item["msg"]
+            remove_tag  = item["remove_tag"]
+            client_use  = item["client_to_use"]
+            owner_id    = item["owner_id"]
+            target      = item["target"]
+            from_ch_id  = item["from_ch_id"]
+            try:
+                await do_forward(dest, msg, remove_tag, client_to_use=client_use)
+                await channels_col.update_one(
+                    {"ch_id": from_ch_id, "setup_id": setup_id},
+                    {"$set": {"last_msg_id": msg.id}}
+                )
+            except Exception as e:
+                log.error(f"[setup={setup_id}] Queue forward error: {e}")
+                err_str = str(e).lower()
+                if any(k in err_str for k in ["admin", "forbidden", "rights", "not allowed", "permission", "chat_write_forbidden", "chatwriteforbidden"]):
+                    try:
+                        if client_use is None:
+                            reason = (
+                                "**Bot is not admin** in this TO channel or does not have post permission.\n\n"
+                                "Please make the Bot admin in this channel and forwarding will resume automatically."
+                            )
+                        else:
+                            reason = (
+                                "Your **logged-in Telegram account** is not admin in this TO channel.\n\n"
+                                "Please make your account admin in this channel and forwarding will resume automatically."
+                            )
+                        await bot.send_message(
+                            owner_id,
+                            f"❌ **Forwarding Stopped!**\n\n"
+                            f"📤 TO Channel: **{target.get('title', target['ch_id'])}**\n\n"
+                            f"🔧 Reason: {reason}",
+                            parse_mode="md",
+                            buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
+                        )
+                    except Exception:
+                        pass
+            finally:
+                q.task_done()
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"_setup_forward_worker [{setup_id}]: {e}")
+
+def get_setup_queue(setup_id: str) -> asyncio.Queue:
+    """Return existing queue for setup, or create a new one with its own worker."""
+    if setup_id not in setup_queues:
+        setup_queues[setup_id] = asyncio.Queue()
+        setup_workers[setup_id] = asyncio.create_task(
+            _setup_forward_worker(setup_id)
+        )
+    return setup_queues[setup_id]
+
 def get_state(uid):
     return user_states.get(uid, {"state": S_IDLE, "data": {}})
 
@@ -1579,38 +1642,27 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                     targets = [to_chs[min(idx, len(to_chs) - 1)]]
                 else:
                     targets = to_chs
+                q = get_setup_queue(setup_id)
                 for target in targets:
-                    try:
-                        ch_id_str = target["ch_id"]
-                        if ch_id_str.lstrip("-").isdigit():
-                            cid = int(ch_id_str)
-                            if cid > 0:
-                                cid = int("-100" + ch_id_str)
-                            dest = cid
-                        else:
-                            dest = target["identifier"]
-                        await do_forward(dest, event.message, remove_tag, client_to_use=client)
-                        await mark_processed(event.message.id, raw_cid)
-                        await channels_col.update_one(
-                            {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
-                            {"$set": {"last_msg_id": event.message.id}}
-                        )
-                    except Exception as e:
-                        log.error(f"Userbot forward error: {e}")
-                        err_str = str(e).lower()
-                        if any(k in err_str for k in ["admin", "forbidden", "rights", "not allowed", "permission", "chat_write_forbidden", "chatwriteforbidden"]):
-                            try:
-                                await bot.send_message(
-                                    user_id,
-                                    f"❌ **Forwarding Stopped!**\n\n"
-                                    f"📤 TO Channel: **{target.get('title', target['ch_id'])}**\n\n"
-                                    f"🔧 Reason: Your **logged-in Telegram account** is not admin in this TO channel.\n\n"
-                                    f"Please make your account admin in this channel and forwarding will resume automatically.",
-                                    parse_mode="md",
-                                    buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
-                                )
-                            except Exception:
-                                pass
+                    ch_id_str = target["ch_id"]
+                    if ch_id_str.lstrip("-").isdigit():
+                        cid = int(ch_id_str)
+                        if cid > 0:
+                            cid = int("-100" + ch_id_str)
+                        dest = cid
+                    else:
+                        dest = target["identifier"]
+                    await q.put({
+                        "dest":          dest,
+                        "msg":           event.message,
+                        "remove_tag":    remove_tag,
+                        "client_to_use": client,
+                        "owner_id":      user_id,
+                        "target":        target,
+                        "setup_id":      setup_id,
+                        "from_ch_id":    from_ch["ch_id"],
+                    })
+                await mark_processed(event.message.id, raw_cid)
         asyncio.create_task(client.run_until_disconnected())
         log.info(f"Userbot started for user {user_id}")
         return True
@@ -1731,31 +1783,20 @@ async def on_new_msg(event):
                 targets = [to_chs[min(idx, len(to_chs) - 1)]]
             else:
                 targets = to_chs
+            q = get_setup_queue(setup_id)
             for target in targets:
-                try:
-                    dest = int(target["ch_id"]) if target["ch_id"].lstrip("-").isdigit() else target["identifier"]
-                    await do_forward(dest, event.message, remove_tag)
-                    await mark_processed(event.message.id, raw_cid)
-                    await channels_col.update_one(
-                        {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
-                        {"$set": {"last_msg_id": event.message.id}}
-                    )
-                except Exception as e:
-                    log.error(f"Forward error: {e}")
-                    err_str = str(e).lower()
-                    if any(k in err_str for k in ["admin", "forbidden", "rights", "not allowed", "permission", "chat_write_forbidden", "chatwriteforbidden"]):
-                        try:
-                            await bot.send_message(
-                                s["owner"],
-                                f"❌ **Forwarding Stopped!**\n\n"
-                                f"📤 TO Channel: **{target.get('title', target['ch_id'])}**\n\n"
-                                f"🔧 Reason: **Bot is not admin** in this TO channel or does not have post permission.\n\n"
-                                f"Please make the Bot admin in this channel and forwarding will resume automatically.",
-                                parse_mode="md",
-                                buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
-                            )
-                        except Exception:
-                            pass
+                dest = int(target["ch_id"]) if target["ch_id"].lstrip("-").isdigit() else target["identifier"]
+                await q.put({
+                    "dest":          dest,
+                    "msg":           event.message,
+                    "remove_tag":    remove_tag,
+                    "client_to_use": None,
+                    "owner_id":      s["owner"],
+                    "target":        target,
+                    "setup_id":      setup_id,
+                    "from_ch_id":    from_ch["ch_id"],
+                })
+            await mark_processed(event.message.id, raw_cid)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BACKGROUND TASKS
