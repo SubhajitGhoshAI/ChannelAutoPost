@@ -118,40 +118,58 @@ async def _setup_forward_worker(setup_id: str):
             owner_id    = item["owner_id"]
             target      = item["target"]
             from_ch_id  = item["from_ch_id"]
-            try:
-                await do_forward(dest, msg, remove_tag, client_to_use=client_use)
-                await channels_col.update_one(
-                    {"ch_id": from_ch_id, "setup_id": setup_id},
-                    {"$set": {"last_msg_id": msg.id}}
-                )
-            except Exception as e:
-                log.error(f"[setup={setup_id}] Queue forward error: {e}")
-                err_str = str(e).lower()
-                if any(k in err_str for k in ["admin", "forbidden", "rights", "not allowed", "permission", "chat_write_forbidden", "chatwriteforbidden"]):
-                    try:
-                        if client_use is None:
-                            reason = (
-                                "**Bot is not admin** in this TO channel or does not have post permission.\n\n"
-                                "Please make the Bot admin in this channel and forwarding will resume automatically."
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await do_forward(dest, msg, remove_tag, client_to_use=client_use)
+                    await channels_col.update_one(
+                        {"ch_id": from_ch_id, "setup_id": setup_id},
+                        {"$set": {"last_msg_id": msg.id}}
+                    )
+                    break
+                except Exception as e:
+                    err_str = str(e).lower()
+                    is_permission_err = any(k in err_str for k in [
+                        "chat_write_forbidden", "chatwriteforbidden",
+                        "chat write forbidden"
+                    ])
+                    is_temp_err = any(k in err_str for k in [
+                        "flood", "too many", "wait", "timeout",
+                        "you can't write", "cannot write"
+                    ])
+                    if is_permission_err:
+                        log.error(f"[setup={setup_id}] Permission error: {e}")
+                        try:
+                            if client_use is None:
+                                reason = (
+                                    "**Bot is not admin** in this TO channel or does not have post permission.\n\n"
+                                    "Please make the Bot admin in this channel and forwarding will resume automatically."
+                                )
+                            else:
+                                reason = (
+                                    "Your **logged-in Telegram account** is not admin in this TO channel.\n\n"
+                                    "Please make your account admin in this channel and forwarding will resume automatically."
+                                )
+                            await bot.send_message(
+                                owner_id,
+                                f"❌ **Forwarding Stopped!**\n\n"
+                                f"📤 TO Channel: **{target.get('title', target['ch_id'])}**\n\n"
+                                f"🔧 Reason: {reason}",
+                                parse_mode="md",
+                                buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
                             )
-                        else:
-                            reason = (
-                                "Your **logged-in Telegram account** is not admin in this TO channel.\n\n"
-                                "Please make your account admin in this channel and forwarding will resume automatically."
-                            )
-                        await bot.send_message(
-                            owner_id,
-                            f"❌ **Forwarding Stopped!**\n\n"
-                            f"📤 TO Channel: **{target.get('title', target['ch_id'])}**\n\n"
-                            f"🔧 Reason: {reason}",
-                            parse_mode="md",
-                            buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
-                        )
-                    except Exception:
-                        pass
-            finally:
-                q.task_done()
-            await asyncio.sleep(2)
+                        except Exception:
+                            pass
+                        break
+                    elif is_temp_err or attempt < max_retries - 1:
+                        wait_sec = 15 * (attempt + 1)
+                        log.warning(f"[setup={setup_id}] Temp error (attempt {attempt+1}/{max_retries}), retrying in {wait_sec}s: {e}")
+                        await asyncio.sleep(wait_sec)
+                    else:
+                        log.error(f"[setup={setup_id}] Forward failed after {max_retries} attempts: {e}")
+                        break
+            q.task_done()
+            await asyncio.sleep(3)
         except Exception as e:
             log.error(f"_setup_forward_worker [{setup_id}]: {e}")
 
@@ -1517,10 +1535,23 @@ async def do_forward(dest, msg, remove_tag: bool, client_to_use=None):
     always fall back to a real forward."""
     c = client_to_use or bot
     if remove_tag and not msg.poll:
+        entities = msg.entities or []
         if msg.media:
-            await c.send_file(dest, msg.media, caption=msg.text or "")
+            try:
+                await c.send_file(dest, msg.media, caption=msg.text or "", formatting_entities=entities)
+            except Exception as e:
+                if "entities" in str(e).lower() or "bounds" in str(e).lower():
+                    await c.send_file(dest, msg.media, caption=msg.text or "")
+                else:
+                    raise
         else:
-            await c.send_message(dest, msg.text or "")
+            try:
+                await c.send_message(dest, msg.text or "", formatting_entities=entities)
+            except Exception as e:
+                if "entities" in str(e).lower() or "bounds" in str(e).lower():
+                    await c.send_message(dest, msg.text or "")
+                else:
+                    raise
     else:
         await c.forward_messages(dest, msg)
 
