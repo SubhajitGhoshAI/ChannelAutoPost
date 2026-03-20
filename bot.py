@@ -810,6 +810,7 @@ async def on_callback(event):
         await _edit_or_respond(event, text, btns)
 
     elif data == "check_fsub":
+        _fsub_cache.pop(uid, None)
         unjoined = await check_force_sub(uid)
         if unjoined:
             await event.answer("You haven't joined all channels yet!", alert=True)
