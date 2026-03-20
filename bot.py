@@ -1538,18 +1538,18 @@ async def do_forward(dest, msg, remove_tag: bool, client_to_use=None):
         entities = msg.entities or []
         if msg.media:
             try:
-                await c.send_file(dest, msg.media, caption=msg.text or "", formatting_entities=entities)
+                await c.send_file(dest, msg.media, caption=msg.text or "", formatting_entities=entities, parse_mode=None)
             except Exception as e:
                 if "entities" in str(e).lower() or "bounds" in str(e).lower():
-                    await c.send_file(dest, msg.media, caption=msg.text or "")
+                    await c.send_file(dest, msg.media, caption=msg.text or "", parse_mode=None)
                 else:
                     raise
         else:
             try:
-                await c.send_message(dest, msg.text or "", formatting_entities=entities)
+                await c.send_message(dest, msg.text or "", formatting_entities=entities, parse_mode=None)
             except Exception as e:
                 if "entities" in str(e).lower() or "bounds" in str(e).lower():
-                    await c.send_message(dest, msg.text or "")
+                    await c.send_message(dest, msg.text or "", parse_mode=None)
                 else:
                     raise
     else:
