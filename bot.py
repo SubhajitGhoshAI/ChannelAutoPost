@@ -163,6 +163,30 @@ async def _setup_forward_worker(setup_id: str):
                         )
                     except Exception:
                         pass
+                elif any(k in err_str for k in ["input entity", "could not find", "peerchannel", "peeruser", "no user", "invalid peer"]):
+                    try:
+                        if client_use is None:
+                            reason = (
+                                "**Bot cannot find this TO channel internally.**\n\n"
+                                "✅ **Fix:** Remove this TO channel and re-add it — "
+                                "bot will auto-connect when re-added as admin."
+                            )
+                        else:
+                            reason = (
+                                "**Your logged-in account has not joined this TO channel.**\n\n"
+                                "✅ **Fix:** Manually join this TO channel with your Telegram account, "
+                                "then forwarding will resume automatically."
+                            )
+                        await bot.send_message(
+                            owner_id,
+                            f"❌ **Forwarding Failed!**\n\n"
+                            f"📤 TO Channel: **{target.get('title', target['ch_id'])}**\n\n"
+                            f"🔧 Reason: {reason}",
+                            parse_mode="md",
+                            buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
+                        )
+                    except Exception:
+                        pass
             finally:
                 q.task_done()
             await asyncio.sleep(3)
