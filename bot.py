@@ -1434,17 +1434,18 @@ async def mark_processed(msg_id, ch_id):
         {"$set": {"ts": datetime.utcnow()}}, upsert=True
     )
 
-async def do_forward(dest, msg, remove_tag: bool):
+async def do_forward(dest, msg, remove_tag: bool, client_to_use=None):
     """Forward a message to dest.  When remove_tag is True the message is
     copied (no 'Forwarded from …' header).  Polls cannot be copied so they
     always fall back to a real forward."""
+    c = client_to_use or bot
     if remove_tag and not msg.poll:
         if msg.media:
-            await bot.send_file(dest, msg.media, caption=msg.text or "")
+            await c.send_file(dest, msg.media, caption=msg.text or "")
         else:
-            await bot.send_message(dest, msg.text or "")
+            await c.send_message(dest, msg.text or "")
     else:
-        await bot.forward_messages(dest, msg)
+        await c.forward_messages(dest, msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1557,18 +1558,7 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                             dest = cid
                         else:
                             dest = target["identifier"]
-                        if remove_tag and not event.message.poll:
-                            from telethon.tl.types import MessageMediaWebPage
-                            if event.message.media and not isinstance(event.message.media, MessageMediaWebPage):
-                                data = await client.download_media(event.message, bytes)
-                                await bot.send_file(dest, data,
-                                                    caption=event.message.text or "",
-                                                    force_document=False)
-                            else:
-                                await bot.send_message(dest, event.message.text or "")
-                        else:
-                            await bot.forward_messages(dest, [event.message.id],
-                                                       from_peer=event.chat_id)
+                        await do_forward(dest, event.message, remove_tag, client_to_use=client)
                         await mark_processed(event.message.id, raw_cid)
                         await channels_col.update_one(
                             {"ch_id": from_ch["ch_id"], "setup_id": setup_id},
