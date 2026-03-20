@@ -1359,7 +1359,21 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
             "or it will be auto-removed."
         )
     elif not bot_is_admin and role == "to":
-        warn = "\n\n⚠️ **Bot is not admin** in this channel! Please make the bot **admin** here so it can post messages."
+        if uid in user_clients:
+            warn = (
+                "\n\n⚠️ **Bot is not admin in this TO channel — Forwarding will NOT work!**\n\n"
+                "You must make **both** of the following admin in this TO channel:\n"
+                "• 🤖 **Bot** — Add the bot as admin in this channel\n"
+                "• 👤 **Your logged-in Telegram account** — Add your account as admin in this channel too\n\n"
+                "Forwarding will remain stopped until both are made admin."
+            )
+        else:
+            warn = (
+                "\n\n⚠️ **Bot is not admin in this TO channel — Forwarding will NOT work!**\n\n"
+                "Please make the **Bot admin** in this channel to start forwarding.\n\n"
+                "💡 If you use 🔑 Login Account, your **logged-in Telegram account** "
+                "must also be made admin in this TO channel."
+            )
 
     # If public FROM channel and bot is NOT admin AND no userbot, warn user
     if ch_type == "public" and role == "from" and not bot_is_admin and uid not in user_clients:
@@ -1487,7 +1501,7 @@ async def _join_public_channels_for_user(user_id: int, client):
             }).to_list(50)
             for ch in pub_chs:
                 ident = ch.get("identifier") or ch["ch_id"]
-                await _userbot_join(user_id, ident)
+                await _userbot_join(user_id, ident, ch_title=ch.get("title"), notify=True)
                 await asyncio.sleep(1)
     except Exception as e:
         log.error(f"_join_public_channels_for_user: {e}")
@@ -1500,6 +1514,23 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
         if not await client.is_user_authorized():
             log.warning(f"Userbot session for {user_id} is no longer valid — removing.")
             await sessions_col.delete_one({"user_id": user_id})
+            try:
+                await bot.send_message(
+                    user_id,
+                    "⚠️ **Your Login Session has expired!**\n\n"
+                    "Possible reasons:\n"
+                    "• You logged out from another device\n"
+                    "• Your Telegram session expired\n"
+                    "• Your account password was changed\n\n"
+                    "🔧 **Action required:**\n"
+                    "Please logout and login again —\n"
+                    "Main Menu → 🔑 Login Account\n\n"
+                    "⚡ Forwarding from public channels will remain stopped until you login again.",
+                    parse_mode="md",
+                    buttons=[[Button.inline("🔑 Login Now", b"login_start")]]
+                )
+            except Exception:
+                pass
             return False
         user_clients[user_id] = client
 
@@ -1566,6 +1597,20 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                         )
                     except Exception as e:
                         log.error(f"Userbot forward error: {e}")
+                        err_str = str(e).lower()
+                        if any(k in err_str for k in ["admin", "forbidden", "rights", "not allowed", "permission", "chat_write_forbidden", "chatwriteforbidden"]):
+                            try:
+                                await bot.send_message(
+                                    user_id,
+                                    f"❌ **Forwarding Stopped!**\n\n"
+                                    f"📤 TO Channel: **{target.get('title', target['ch_id'])}**\n\n"
+                                    f"🔧 Reason: Your **logged-in Telegram account** is not admin in this TO channel.\n\n"
+                                    f"Please make your account admin in this channel and forwarding will resume automatically.",
+                                    parse_mode="md",
+                                    buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
+                                )
+                            except Exception:
+                                pass
         asyncio.create_task(client.run_until_disconnected())
         log.info(f"Userbot started for user {user_id}")
         return True
@@ -1697,6 +1742,20 @@ async def on_new_msg(event):
                     )
                 except Exception as e:
                     log.error(f"Forward error: {e}")
+                    err_str = str(e).lower()
+                    if any(k in err_str for k in ["admin", "forbidden", "rights", "not allowed", "permission", "chat_write_forbidden", "chatwriteforbidden"]):
+                        try:
+                            await bot.send_message(
+                                s["owner"],
+                                f"❌ **Forwarding Stopped!**\n\n"
+                                f"📤 TO Channel: **{target.get('title', target['ch_id'])}**\n\n"
+                                f"🔧 Reason: **Bot is not admin** in this TO channel or does not have post permission.\n\n"
+                                f"Please make the Bot admin in this channel and forwarding will resume automatically.",
+                                parse_mode="md",
+                                buttons=[[Button.inline("📋 My Setups", b"setups_list")]]
+                            )
+                        except Exception:
+                            pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BACKGROUND TASKS
