@@ -151,7 +151,7 @@ async def _setup_forward_worker(setup_id: str):
                         pass
             finally:
                 q.task_done()
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
         except Exception as e:
             log.error(f"_setup_forward_worker [{setup_id}]: {e}")
 
