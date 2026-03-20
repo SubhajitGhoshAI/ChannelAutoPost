@@ -1513,7 +1513,7 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
         asyncio.create_task(_userbot_join(uid, getattr(entity, "username", None) or ch_id, ch_title=title, notify=True))
     # Pending private channel
     warn = ""
-    if ch_type == "private" and not bot_is_admin and role == "from":
+    if ch_type == "private" and not bot_is_admin and role == "from" and uid not in user_clients:
         await pending_col.insert_one({
             "ch_id": ch_id, "setup_id": setup_id,
             "uid": uid, "added_at": datetime.utcnow(),
@@ -1730,7 +1730,7 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
 
             from_chs = await channels_col.find({
                 "ch_id": {"$in": [raw_cid, short]},
-                "role": "from", "ch_type": "public",
+                "role": "from",
             }).to_list(10)
 
             for from_ch in from_chs:
