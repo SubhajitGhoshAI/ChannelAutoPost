@@ -1519,9 +1519,15 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
             "uid": uid, "added_at": datetime.utcnow(),
         })
         warn = (
-            "\n\n⚠️ **Private channel detected!**\n"
-            "Please make the bot **admin** in this channel within **15 minutes**, "
-            "or it will be auto-removed."
+            "\n\n⚠️ **Private FROM Channel — Action Required!**\n\n"
+            "Bot is **not admin** in this channel. You have **15 minutes** to do one of the following:\n\n"
+            "**Option A — Make Bot Admin:**\n"
+            "Add the bot as admin in this FROM channel → forwarding starts automatically\n\n"
+            "**Option B — Use Your Account:**\n"
+            "• Tap **🔑 Login Account** on the main menu\n"
+            "• After login, **manually join** this FROM channel with your Telegram account\n"
+            "• No bot admin needed\n\n"
+            "⏱ If neither is done within **15 minutes**, this channel will be auto-removed."
         )
     elif not bot_is_admin and role == "to":
         if uid in user_clients:
