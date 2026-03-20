@@ -100,6 +100,9 @@ S_WAIT_2FA        = "wait_2fa"
 user_clients:  dict = {}
 # Temporary clients used during login before session is saved
 login_clients: dict = {}
+# Force-sub check cache {user_id: (datetime, result)}
+_fsub_cache:   dict = {}
+FSUB_CACHE_TTL = 300  # 5 minutes
 
 # ── Per-setup Forward Queues (each setup gets its own sequential queue) ────────
 setup_queues:  dict = {}   # {setup_id: asyncio.Queue}
@@ -124,6 +127,17 @@ async def _setup_forward_worker(setup_id: str):
                     {"ch_id": from_ch_id, "setup_id": setup_id},
                     {"$set": {"last_msg_id": msg.id}}
                 )
+            except FloodWaitError as e:
+                log.warning(f"[setup={setup_id}] FloodWait {e.seconds}s — retrying after wait")
+                await asyncio.sleep(e.seconds + 1)
+                try:
+                    await do_forward(dest, msg, remove_tag, client_to_use=client_use)
+                    await channels_col.update_one(
+                        {"ch_id": from_ch_id, "setup_id": setup_id},
+                        {"$set": {"last_msg_id": msg.id}}
+                    )
+                except Exception as retry_e:
+                    log.error(f"[setup={setup_id}] Retry after FloodWait failed: {retry_e}")
             except Exception as e:
                 log.error(f"[setup={setup_id}] Queue forward error: {e}")
                 err_str = str(e).lower()
@@ -152,6 +166,9 @@ async def _setup_forward_worker(setup_id: str):
             finally:
                 q.task_done()
             await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            log.info(f"Worker {setup_id} cancelled")
+            return
         except Exception as e:
             log.error(f"_setup_forward_worker [{setup_id}]: {e}")
 
@@ -180,6 +197,19 @@ DEFAULT_FILTERS = {
     "video_note": True, "poll": False, "forward": True,
     "remove_forward_tag": False,
 }
+
+async def ensure_indexes():
+    """Create DB indexes for performance and TTL cleanup."""
+    await users_col.create_index([("user_id", 1)], unique=True, background=True)
+    await setups_col.create_index([("setup_id", 1)], background=True)
+    await setups_col.create_index([("owner", 1)], background=True)
+    await channels_col.create_index([("ch_id", 1), ("setup_id", 1), ("role", 1)], background=True)
+    await channels_col.create_index([("setup_id", 1), ("role", 1)], background=True)
+    await processed_col.create_index([("msg_id", 1), ("ch_id", 1)], background=True)
+    # TTL: auto-delete processed entries after 7 days
+    await processed_col.create_index([("ts", 1)], expireAfterSeconds=604800, background=True)
+    await sessions_col.create_index([("user_id", 1)], unique=True, background=True)
+    log.info("DB indexes ensured")
 
 async def get_setting(key, default=None):
     doc = await settings_col.find_one({"key": key})
@@ -232,6 +262,12 @@ async def try_start_trial(user_id):
 async def check_force_sub(user_id):
     if not FORCE_SUB:
         return []
+    # Serve from cache if fresh
+    cached = _fsub_cache.get(user_id)
+    if cached:
+        ts, result = cached
+        if (datetime.utcnow() - ts).total_seconds() < FSUB_CACHE_TTL:
+            return result
     from telethon.tl.functions.channels import GetParticipantRequest
     from telethon.errors import UserNotParticipantError
     unjoined = []
@@ -261,6 +297,7 @@ async def check_force_sub(user_id):
                     unjoined.append((getattr(entity, "title", str(ch)), link))
         except Exception:
             pass
+    _fsub_cache[user_id] = (datetime.utcnow(), unjoined)
     return unjoined
 
 async def send_force_sub_msg(event, unjoined):
@@ -847,6 +884,7 @@ async def on_callback(event):
     elif data.startswith("del_ch_ok:"):
         _, role, setup_id, ch_id = data.split(":", 3)
         await channels_col.delete_one({"ch_id": ch_id, "setup_id": setup_id})
+        await pending_col.delete_one({"ch_id": ch_id, "setup_id": setup_id})
         await event.answer("✅ Channel removed!")
         await show_channel_list(event, uid, setup_id, role)
 
@@ -895,6 +933,12 @@ async def on_callback(event):
         setup_id = data.split(":", 1)[1]
         await setups_col.delete_one({"setup_id": setup_id, "owner": uid})
         await channels_col.delete_many({"setup_id": setup_id})
+        # Cleanup in-memory queue and worker task to prevent ghost forwarding
+        if setup_id in setup_workers:
+            setup_workers[setup_id].cancel()
+            del setup_workers[setup_id]
+        if setup_id in setup_queues:
+            del setup_queues[setup_id]
         await event.answer("✅ Setup deleted!")
         await show_setups_list(event, uid)
 
@@ -1131,6 +1175,13 @@ async def on_text(event):
                 await bot.send_message(u["user_id"], text, parse_mode="html")
                 sent += 1
                 await asyncio.sleep(0.05)
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+                try:
+                    await bot.send_message(u["user_id"], text, parse_mode="html")
+                    sent += 1
+                except Exception:
+                    failed += 1
             except Exception:
                 failed += 1
         await status.edit(
@@ -1569,6 +1620,28 @@ async def _join_public_channels_for_user(user_id: int, client):
     except Exception as e:
         log.error(f"_join_public_channels_for_user: {e}")
 
+async def _userbot_keepalive(user_id: int, session_string: str):
+    """Keep userbot alive; auto-reconnect on unexpected disconnect."""
+    while True:
+        try:
+            client = user_clients.get(user_id)
+            if client and client.is_connected():
+                await client.run_until_disconnected()
+            # Disconnected — try to reconnect
+            log.warning(f"Userbot {user_id} disconnected — reconnecting in 10s")
+            user_clients.pop(user_id, None)
+            await asyncio.sleep(10)
+            ok = await start_userbot(user_id, session_string)
+            if ok:
+                return  # start_userbot already spawned a new keepalive task
+            else:
+                break   # session invalid, stop retrying
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error(f"_userbot_keepalive {user_id}: {e}")
+            await asyncio.sleep(15)
+
 async def start_userbot(user_id: int, session_string: str) -> bool:
     """Start a userbot client for a user and register its event handler."""
     try:
@@ -1610,6 +1683,9 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
             }).to_list(10)
 
             for from_ch in from_chs:
+                # Skip if bot is admin in this FROM channel — bot handler will process it
+                if from_ch.get("bot_is_admin"):
+                    continue
                 setup_id = from_ch["setup_id"]
                 s = await setups_col.find_one({
                     "setup_id": setup_id, "owner": user_id, "active": True
@@ -1663,7 +1739,7 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                         "from_ch_id":    from_ch["ch_id"],
                     })
                 await mark_processed(event.message.id, raw_cid)
-        asyncio.create_task(client.run_until_disconnected())
+        asyncio.create_task(_userbot_keepalive(user_id, session_string))
         log.info(f"Userbot started for user {user_id}")
         return True
     except Exception as e:
@@ -1785,7 +1861,14 @@ async def on_new_msg(event):
                 targets = to_chs
             q = get_setup_queue(setup_id)
             for target in targets:
-                dest = int(target["ch_id"]) if target["ch_id"].lstrip("-").isdigit() else target["identifier"]
+                ch_id_str = target["ch_id"]
+                if ch_id_str.lstrip("-").isdigit():
+                    cid = int(ch_id_str)
+                    if cid > 0:
+                        cid = int("-100" + ch_id_str)
+                    dest = cid
+                else:
+                    dest = target["identifier"]
                 await q.put({
                     "dest":          dest,
                     "msg":           event.message,
@@ -1911,7 +1994,7 @@ async def task_premium_expiry():
         await asyncio.sleep(3600)
 
 async def _send_restart_notifications():
-    """On restart, send a message to all active TO channels to warm up entity cache."""
+    """On restart, silently warm up entity cache for active TO channels (no spam)."""
     await asyncio.sleep(3)
     try:
         active_setups = await setups_col.find({"active": True}).to_list(200)
@@ -1926,15 +2009,11 @@ async def _send_restart_notifications():
                 try:
                     cid = ch["ch_id"]
                     dest = int(cid) if cid.startswith("-") else int("-100" + cid)
-                    await bot.send_message(
-                        dest,
-                        "🔄 **ChannelAutoPost restarted.**\n\nForwarding is active.",
-                        parse_mode="md"
-                    )
+                    await bot.get_entity(dest)  # warm up entity cache silently
                     notified.add(ch["ch_id"])
                     await asyncio.sleep(0.5)
                 except Exception as e:
-                    log.warning(f"Restart notify failed for {ch.get('identifier', ch['ch_id'])}: {e}")
+                    log.warning(f"Cache warmup failed for {ch.get('identifier', ch['ch_id'])}: {e}")
     except Exception as e:
         log.error(f"_send_restart_notifications: {e}")
 
@@ -1944,6 +2023,7 @@ async def _send_restart_notifications():
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
     log.info("ChannelAutoPost Bot started!")
+    await ensure_indexes()
     asyncio.create_task(_send_restart_notifications())
     await load_all_userbots()
     asyncio.create_task(task_poll_public())
