@@ -1529,6 +1529,15 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
             "• No bot admin needed\n\n"
             "⏱ If neither is done within **15 minutes**, this channel will be auto-removed."
         )
+    elif ch_type == "private" and not bot_is_admin and role == "from" and uid in user_clients:
+        warn = (
+            "\n\n⚠️ **Private FROM Channel — Manual Join Required!**\n\n"
+            "Your logged-in Telegram account must be a **member** of this private channel.\n\n"
+            "✅ **What to do:**\n"
+            "• Join this private channel manually with your Telegram account\n"
+            "• Once joined, forwarding will work automatically\n\n"
+            "❌ If your account is not a member of this channel, forwarding will NOT work."
+        )
     elif not bot_is_admin and role == "to":
         if uid in user_clients:
             warn = (
