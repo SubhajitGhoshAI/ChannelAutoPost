@@ -1695,14 +1695,20 @@ async def do_forward(dest, msg, remove_tag: bool, client_to_use=None, filters=No
 
     if need_copy and not msg.poll:
         text = msg.text or ""
-        if smart or remove_all:
-            text = _strip_links(text, tg_only=False, smart=smart)
+        if smart:
+            text = _strip_links(text, tg_only=False, smart=True)
+        elif remove_all:
+            text = _strip_links(text, tg_only=False, smart=False)
         elif remove_tg:
             text = _strip_links(text, tg_only=True, smart=False)
-        if msg.media:
-            await c.send_file(dest, msg.media, caption=text)
+        from telethon.tl.types import MessageMediaWebPage
+        real_media = msg.media if msg.media and not isinstance(msg.media, MessageMediaWebPage) else None
+        if not text.strip() and not real_media:
+            return
+        if real_media:
+            await c.send_file(dest, real_media, caption=text)
         else:
-            await c.send_message(dest, text)
+            await c.send_message(dest, text, link_preview=False)
     else:
         await c.forward_messages(dest, msg)
 
