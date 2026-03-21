@@ -4,6 +4,7 @@ All controls via inline buttons. Minimal typing required.
 """
 
 import logging
+import re
 import asyncio
 import uuid
 from datetime import datetime, timedelta
@@ -121,8 +122,9 @@ async def _setup_forward_worker(setup_id: str):
             owner_id    = item["owner_id"]
             target      = item["target"]
             from_ch_id  = item["from_ch_id"]
+            fltrs       = item.get("filters", {})
             try:
-                await do_forward(dest, msg, remove_tag, client_to_use=client_use)
+                await do_forward(dest, msg, remove_tag, client_to_use=client_use, filters=fltrs)
                 await channels_col.update_one(
                     {"ch_id": from_ch_id, "setup_id": setup_id},
                     {"$set": {"last_msg_id": msg.id}}
@@ -220,6 +222,9 @@ DEFAULT_FILTERS = {
     "audio": True, "sticker": True, "gif": True, "voice": True,
     "video_note": True, "poll": False, "forward": True,
     "remove_forward_tag": False,
+    "remove_tg_links": False,
+    "remove_all_links": False,
+    "smart_link_remove": False,
 }
 
 async def ensure_indexes():
@@ -457,6 +462,9 @@ FILTER_LABELS = {
     "poll":               "📊 Poll",
     "forward":            "🔁 Forwarded",
     "remove_forward_tag": "🚫 Remove Fwd Tag",
+    "remove_tg_links":    "🔗 Remove TG Links",
+    "remove_all_links":   "🚫 Remove All Links",
+    "smart_link_remove":  "🧹 Smart Link Remove",
 }
 
 async def show_filters(event, uid, setup_id):
@@ -1642,16 +1650,59 @@ async def mark_processed(msg_id, ch_id):
         {"$set": {"ts": datetime.utcnow()}}, upsert=True
     )
 
-async def do_forward(dest, msg, remove_tag: bool, client_to_use=None):
+def _has_link(line, tg_only=False):
+    if tg_only:
+        return bool(re.search(r"https?://t\.me/\S+", line) or re.search(r"@[\w]{3,}", line))
+    return bool(re.search(r"https?://\S+", line) or re.search(r"@[\w]{3,}", line))
+
+def _strip_links(text, tg_only=False, smart=False):
+    if not text:
+        return text
+    lines = text.split("\n")
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _has_link(line, tg_only=tg_only):
+            # smart mode: also remove the line just before the link line
+            if smart and result:
+                result.pop()
+            i += 1
+            continue
+        result.append(line)
+        i += 1
+    # collapse multiple blank lines into one
+    cleaned = []
+    prev_blank = False
+    for line in result:
+        is_blank = line.strip() == ""
+        if is_blank and prev_blank:
+            continue
+        cleaned.append(line)
+        prev_blank = is_blank
+    return "\n".join(cleaned).strip()
+
+async def do_forward(dest, msg, remove_tag: bool, client_to_use=None, filters=None):
     """Forward a message to dest.  When remove_tag is True the message is
     copied (no 'Forwarded from …' header).  Polls cannot be copied so they
     always fall back to a real forward."""
     c = client_to_use or bot
-    if remove_tag and not msg.poll:
+    filters    = filters or {}
+    remove_tg  = filters.get("remove_tg_links", False)
+    remove_all = filters.get("remove_all_links", False)
+    smart      = filters.get("smart_link_remove", False)
+    need_copy  = remove_tag or remove_tg or remove_all or smart
+
+    if need_copy and not msg.poll:
+        text = msg.text or ""
+        if smart or remove_all:
+            text = _strip_links(text, tg_only=False, smart=smart)
+        elif remove_tg:
+            text = _strip_links(text, tg_only=True, smart=False)
         if msg.media:
-            await c.send_file(dest, msg.media, caption=msg.text or "")
+            await c.send_file(dest, msg.media, caption=text)
         else:
-            await c.send_message(dest, msg.text or "")
+            await c.send_message(dest, text)
     else:
         await c.forward_messages(dest, msg)
 
@@ -1812,6 +1863,7 @@ async def start_userbot(user_id: int, session_string: str) -> bool:
                         "dest":          dest,
                         "msg":           event.message,
                         "remove_tag":    remove_tag,
+                        "filters":       filters,
                         "client_to_use": client,
                         "owner_id":      user_id,
                         "target":        target,
@@ -1953,6 +2005,7 @@ async def on_new_msg(event):
                     "dest":          dest,
                     "msg":           event.message,
                     "remove_tag":    remove_tag,
+                    "filters":       filters,
                     "client_to_use": None,
                     "owner_id":      s["owner"],
                     "target":        target,
