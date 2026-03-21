@@ -1649,9 +1649,9 @@ async def do_forward(dest, msg, remove_tag: bool, client_to_use=None):
     c = client_to_use or bot
     if remove_tag and not msg.poll:
         if msg.media:
-            await c.send_file(dest, msg.media, caption=msg.text or "", formatting_entities=msg.entities or [])
+            await c.send_file(dest, msg.media, caption=msg.text or "")
         else:
-            await c.send_message(dest, msg.text or "", formatting_entities=msg.entities or [])
+            await c.send_message(dest, msg.text or "")
     else:
         await c.forward_messages(dest, msg)
 
