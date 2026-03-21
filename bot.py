@@ -748,6 +748,7 @@ async def cmd_listpremium(event):
         chunks.append(current)
     for chunk in chunks:
         await event.respond(chunk, parse_mode="md")
+        
 @bot.on(events.NewMessage(pattern=r"^/status$", func=lambda e: e.is_private))
 async def cmd_status(event):
     uid = event.sender_id
