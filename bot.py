@@ -713,7 +713,7 @@ async def cmd_listpremium(event):
     now = datetime.utcnow()
     active_users = await users_col.find({
         "premium_until": {"$gt": now}
-    }).to_list(500)
+    }).sort("premium_until", 1).to_list(500)
     if not active_users:
         await event.respond("📋 **Active Premium Users**\n\nNo active premium users found.")
         return
