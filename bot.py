@@ -717,7 +717,8 @@ async def cmd_listpremium(event):
     if not active_users:
         await event.respond("📋 **Active Premium Users**\n\nNo active premium users found.")
         return
-    lines = [f"👑 **Active Premium Users: {len(active_users)}**\n"]
+    header = f"👑 **Active Premium Users: {len(active_users)}**\n"
+    user_lines = []
     for i, user in enumerate(active_users, 1):
         uid_u       = user["user_id"]
         days_left   = (user["premium_until"] - now).days
@@ -728,13 +729,25 @@ async def cmd_listpremium(event):
         from_chs    = await channels_col.count_documents({"setup_id": {"$in": setup_ids}, "role": "from"})
         to_chs      = await channels_col.count_documents({"setup_id": {"$in": setup_ids}, "role": "to"})
         name        = user.get("first_name") or user.get("username") or str(uid_u)
-        lines.append(
+        user_lines.append(
             f"{i}. {plan_icon} `{uid_u}` — **{name}**\n"
             f"   ⚙️ Setups: {len(user_setups)} | 📥 FROM: {from_chs} | 📤 TO: {to_chs}\n"
             f"   ⏳ Days Left: {days_left}"
         )
-    await event.respond("\n\n".join(lines), parse_mode="md")
-
+    MAX_LEN = 4000
+    chunks   = []
+    current  = header
+    for line in user_lines:
+        block = "\n\n" + line
+        if len(current) + len(block) > MAX_LEN:
+            chunks.append(current)
+            current = line
+        else:
+            current += block
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        await event.respond(chunk, parse_mode="md")
 @bot.on(events.NewMessage(pattern=r"^/status$", func=lambda e: e.is_private))
 async def cmd_status(event):
     uid = event.sender_id
