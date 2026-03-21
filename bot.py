@@ -133,7 +133,7 @@ async def _setup_forward_worker(setup_id: str):
                 log.warning(f"[setup={setup_id}] FloodWait {e.seconds}s — retrying after wait")
                 await asyncio.sleep(e.seconds + 1)
                 try:
-                    await do_forward(dest, msg, remove_tag, client_to_use=client_use)
+                    await do_forward(dest, msg, remove_tag, client_to_use=client_use, filters=fltrs)
                     await channels_col.update_one(
                         {"ch_id": from_ch_id, "setup_id": setup_id},
                         {"$set": {"last_msg_id": msg.id}}
