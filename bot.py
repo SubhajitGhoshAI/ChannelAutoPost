@@ -1280,7 +1280,7 @@ async def on_text(event):
             await wait_msg.edit(
                 "📱 **OTP Sent!**\n\n"
                 "Enter the **verification code** you received on Telegram:\n"
-                "_Example: 12345_\n\n"
+                "Example: 1 2 3 4 5\n\n"
                 "Send /cancel to abort.",
                 parse_mode="md"
             )
@@ -1446,14 +1446,43 @@ async def process_add_channel(event, uid, raw_input, setup_id, role):
     wait = await event.respond("⏳ Looking up channel...")
     back_btn = [[Button.inline("◀️ Back to Setup", f"setup:{setup_id}".encode())]]
 
-    try:
-        entity = await bot.get_entity(int(ident) if ident.lstrip("-").isdigit() else ident)
-    except (UsernameNotOccupiedError, UsernameInvalidError):
-        await wait.edit(f"❌ Channel not found: `{ident}`\n\nCheck the username and try again.",
-                        buttons=back_btn, parse_mode="md")
-        return
-    except Exception as e:
-        await wait.edit(f"❌ Error: {str(e)[:200]}", buttons=back_btn, parse_mode="md")
+    resolved = int(ident) if ident.lstrip("-").isdigit() else ident
+    entity = None
+    last_error = None
+
+    userbot = user_clients.get(uid)
+    if userbot is not None:
+        try:
+            entity = await userbot.get_entity(resolved)
+        except Exception as e:
+            last_error = e
+
+    if entity is None:
+        try:
+            entity = await bot.get_entity(resolved)
+        except (UsernameNotOccupiedError, UsernameInvalidError):
+            await wait.edit(
+                f"❌ Channel not found: `{ident}`\n\nCheck the username and try again.",
+                buttons=back_btn, parse_mode="md",
+            )
+            return
+        except Exception as e:
+            last_error = e
+            entity = None
+
+    if entity is None:
+        err_str = str(last_error)
+        if any(k in err_str.lower() for k in ["private", "forbidden", "permission", "peerchannel", "input entity"]):
+            await wait.edit(
+                "❌ **Could not access this private channel.**\n\n"
+                "Make sure **at least one** of the following is true:\n"
+                "• Your logged-in Telegram account is a **member** of this channel\n"
+                "• The **bot is admin** in this channel\n\n"
+                f"_Details: {err_str[:120]}_",
+                buttons=back_btn, parse_mode="md",
+            )
+        else:
+            await wait.edit(f"❌ Error: {err_str[:200]}", buttons=back_btn, parse_mode="md")
         return
 
     ch_id   = str(entity.id)
@@ -2148,7 +2177,9 @@ async def _send_restart_notifications():
                 try:
                     cid = ch["ch_id"]
                     dest = int(cid) if cid.startswith("-") else int("-100" + cid)
-                    await bot.get_entity(dest)  # warm up entity cache silently
+                    owner_id = s.get("owner")
+                    client_warm = user_clients.get(owner_id) or bot
+                    await client_warm.get_entity(dest)  # warm up entity cache silently
                     notified.add(ch["ch_id"])
                     await asyncio.sleep(0.5)
                 except Exception as e:
